@@ -1,0 +1,132 @@
+model:
+  base_learning_rate: 5.e-6
+  train_target: ldm.models.diffusion.ddpm.ProjectionDiffusion
+  test_target: inference.models.InferLatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l1
+    # first_stage_key: image
+    first_stage_key: o
+    cond_stage_key: 
+      crossattn: index
+      concat: o_ctxt
+    label_key: index_raw
+    conditioning_key: hybrid
+    image_size: [256, 512]  # after first-stage encoding, infer size
+    channels: 1            # after first-stage encoding
+    monitor: train/loss_simple
+    cond_stage_trainable: true
+    shape: [64, 64, 32]
+    ckpt_path: /home/dlr/data/ldm/proj_256_512_test3/checkpoints/last.ckpt
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.ProjectionUNetModelV2
+      params:
+        # in_channels: 1
+        # out_channels: 1
+        # model_channels: 16
+        # attention_resolutions: []
+        # num_res_blocks: 1
+        # channel_mult: [1,2,4,8]
+        # num_head_channels: 32
+        # use_checkpoint: true
+        # use_spatial_transformer: true
+        # context_dim: 64
+        in_channels: 1
+        out_channels: 1
+        model_channels: 64
+        attention_resolutions: [8, 16]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 8, 8]
+        num_head_channels: 64
+        use_checkpoint: true  # always use ckpt
+        dims: 2
+        use_spatial_transformer: true
+        context_dim: 32
+
+    first_stage_config:
+      target: ldm.modules.encoders.modules.IdentityFirstStage
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.HybridConditionEncoder
+      params:
+        crossattn_module:
+          # target: ldm.modules.encoders.modules.TransformerEmbedder
+          # params:
+          #   n_embed: 64
+          #   n_layer: 2
+          #   vocab_size: 180
+          #   use_pos_emb: false
+          target: ldm.modules.encoders.modules.AngleEmbedder
+          params:
+            embed_angles: [0, 90, 180, 270]
+            d_embed: 32
+        concat_module:
+          target: ldm.modules.encoders.modules.IdentityEmbedder
+    
+    # cond_stage_config:
+    #   target: ldm.modules.encoders.modules.TransformerEmbedder
+    #   params:
+    #     n_embed: 64
+    #     n_layer: 2
+    #     vocab_size: 360
+    #     use_pos_emb: false
+          
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 8
+    wrap: False
+    train:
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
+      params:
+        split: train
+        data_dir: /home/dlr/data/datasets/synthetic/projs_set0610
+        shape: [64, 64, 32]
+        # max_size: 5
+    validation:
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
+      params:
+        split: val
+        max_size: 5
+        data_dir: /home/dlr/data/datasets/synthetic/projs_set0610
+        shape: [64, 64, 32]
+    # test:
+    #   target: ldm.data.make_dataset.from_latents.LatentsDataset
+    #   params:
+    #     split: test
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        train_batch_frequency: 100
+        val_batch_frequency: 1
+        max_images: 10
+        log_images_kwargs: 
+          ddim_steps: 50
+        logger:
+          o_ctxt:
+            target: image_rescale
+          o_trgt:
+            target: image_rescale
+          o_hat_trgt:
+            target: image_rescale
+          o_final:
+            target: image_rescale
+          o_hat_final:
+            target: image_rescale
+          s:
+            target: image_rescale
+
+  trainer:
+    benchmark: true
+    max_epochs: 1000
+    replace_sampler_ddp: true
+    limit_test_batches: 500

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
 
-from ldm.modules.diffusionmodules.util import checkpoint, conv_nd
+from ldm.modules.diffusionmodules.util import checkpoint, conv_nd, normalization
 
 
 def exists(val):
@@ -73,10 +73,6 @@ def zero_module(module):
     return module
 
 
-def Normalize(in_channels):
-    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-
-
 class LinearAttention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32, dims=3):
         super().__init__()
@@ -102,7 +98,7 @@ class SpatialSelfAttention(nn.Module):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels)
+        self.norm = normalization(in_channels)
         self.q = torch.nn.Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
@@ -225,11 +221,11 @@ class SpatialTransformer(nn.Module):
     Finally, reshape to image
     """
     def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None, dims=3, use_linear=False, use_checkpoint=True):
+                 depth=1, dropout=0., context_dim=None, dims=3, use_linear=False, use_checkpoint=True, groups=32):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = Normalize(in_channels)
+        self.norm = normalization(in_channels, groups=groups)
 
         self.proj_in = conv_nd(dims,
                                in_channels,
@@ -260,7 +256,10 @@ class SpatialTransformer(nn.Module):
         x = rearrange(x, 'b c ... -> b (...) c')
         for block in self.transformer_blocks:
             x = block(x, context=context)
-        pattern = "b (h w d) c -> b c h w d" if self.dims == 3 else "b (h w) c -> b c h w"
-        x = rearrange(x, pattern, h=shp[0], w=shp[1])
+        if len(shp) > 1:
+            pattern = "b (h w d) c -> b c h w d" if self.dims == 3 else "b (h w) c -> b c h w"
+            x = rearrange(x, pattern, h=shp[0], w=shp[1])
+        else:
+            x = rearrange(x, 'b d c -> b c d')
         x = self.proj_out(x)
         return x + x_in 

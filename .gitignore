@@ -48,3 +48,9 @@ ehthumbs.db
 Thumbs.db 
 
 dependency/
+wandb/
+baselines/
+
+*.npy
+*.npz
+*.nii.gz

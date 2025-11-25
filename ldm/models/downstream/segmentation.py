@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
+import copy
 import random
 import numpy as np
 from einops import rearrange, repeat
@@ -152,9 +153,7 @@ class Segmentator(BasePytorchLightningTrainer):
                                    out_channels=self.num_classes,)
         elif model_name == 'unetpp':
             self.model = BasicUNetPlusPlus(self.dims, in_channels, self.num_classes,)
-        elif model_name == 'sin':
-            self.model = SinusoidalUNet(ch=16, ch_mult=(1, 2, 4, 8, 16), num_res_blocks=1, attn_resolutions=[], resolution=max(self.image_size),
-                                        in_channels=in_channels, out_ch=self.num_classes, dims=self.dims, nonlinearity=SinNonlinearity())
+        
     
     def _multiclass_metrics(self, x, y, prefix=""):
         logs = {}
@@ -284,213 +283,370 @@ class Segmentator(BasePytorchLightningTrainer):
         return [opt], [sch]
     
     
-class SinusoidalUNet(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels, nonlinearity,
-                 resolution, use_linear_attn=False, attn_type="vanilla", dims=3):
+def conv_nd(dims, *args, **kwargs):
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def linear(*args, **kwargs):
+    return nn.Linear(*args, **kwargs)
+
+
+def normalization(channels):
+    return nn.GroupNorm(32, channels)
+
+
+def zero_module(module, enabled=True):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    if enabled:
+        for p in module.parameters():
+            p.detach().zero_()
+    return module
+
+
+def checkpoint(func, inputs, params, flag):
+    if flag:
+        args = tuple(inputs) + tuple(params)
+        return CheckpointFunction.apply(func, len(inputs), *args)
+    else:
+        return func(*inputs)
+
+
+class CheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.input_tensors = list(args[:length])
+        ctx.input_params = list(args[length:])
+
+        with torch.no_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        return output_tensors
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        ctx.input_tensors = [x.detach().requires_grad_(True) if torch.is_tensor(x) else x for x in ctx.input_tensors]
+        with torch.enable_grad():
+            # Fixes a bug where the first op in run_function modifies the
+            # Tensor storage in place, which is not allowed for detach()'d
+            # Tensors.
+            shallow_copies = [x.view_as(x) if torch.is_tensor(x) else x for x in ctx.input_tensors]
+            output_tensors = ctx.run_function(*shallow_copies)
+        input_tensors_without_none = [x for x in ctx.input_tensors if torch.is_tensor(x)]
+        input_tensors_indices = [ix for ix, x in enumerate(ctx.input_tensors) if not torch.is_tensor(x)]
+        input_grads = torch.autograd.grad(
+            output_tensors,
+            input_tensors_without_none + [x for x in ctx.input_params if x.requires_grad],
+            output_grads,
+            allow_unused=True,
+        )
+        output_grads = [None] * (len(ctx.input_tensors) + len(ctx.input_params))
+        ii = 0
+        for ix in range(len(ctx.input_tensors) + len(ctx.input_params)):
+            if ix not in input_tensors_indices and (ctx.input_tensors + ctx.input_params)[ix].requires_grad:
+                output_grads[ix] = input_grads[ii]
+                ii += 1
+            else: output_grads[ix] = None
+
+        output_grads = tuple(output_grads)
+        del ctx.input_tensors
+        del ctx.input_params
+        del output_tensors
+        return (None, None) + output_grads
+    
+    
+class Downsample(nn.Module):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None,padding=1):
         super().__init__()
-        if use_linear_attn: attn_type = "linear"
-        self.ch = ch
-        self.out_ch = out_ch
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        self.in_channels = in_channels
-        self.conv_nd = getattr(nn, f"Conv{dims}d", nn.Identity)
-        self.batchnorm_nd = torch.nn.BatchNorm2d if dims == 2 else torch.nn.BatchNorm3d if dims == 3 else None
-        self.nonlinearity = nonlinearity
-        
-        # downsampling
-        self.conv_in = self.conv_nd(in_channels,
-                                    self.ch,
-                                    kernel_size=3,
-                                    stride=1,
-                                    padding=1)
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        stride = 2 if dims != 3 else (2, 2, 2)
+        if use_conv:
+            self.op = conv_nd(
+                dims, self.channels, self.out_channels, 3, stride=stride, padding=padding
+            )
+        else:
+            assert self.channels == self.out_channels
+            self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
-        curr_res = resolution
-        in_ch_mult = (1,)+tuple(ch_mult)
-        self.down = nn.ModuleList()
-        for i_level in range(self.num_resolutions):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
-            block_in = ch*in_ch_mult[i_level]
-            block_out = ch*ch_mult[i_level]
-            for i_block in range(self.num_res_blocks):
-                block.append(ResnetBlock(in_channels=block_in,
-                                         out_channels=block_out,
-                                         dropout=dropout, dims=dims, nonlinearity=nonlinearity))
-                block_in = block_out
-                if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
-            down = nn.Module()
-            down.block = block
-            down.attn = attn
-            if i_level != self.num_resolutions-1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
-                curr_res = curr_res // 2
-            self.down.append(down)
-
-        # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       dropout=dropout, dims=dims, nonlinearity=nonlinearity)
-        # self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       dropout=dropout, dims=dims, nonlinearity=nonlinearity)
-
-        # upsampling
-        self.up = nn.ModuleList()
-        for i_level in reversed(range(self.num_resolutions)):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
-            block_out = ch*ch_mult[i_level]
-            skip_in = ch*ch_mult[i_level]
-            for i_block in range(self.num_res_blocks+1):
-                if i_block == self.num_res_blocks:
-                    skip_in = ch*in_ch_mult[i_level]
-                block.append(ResnetBlock(in_channels=block_in+skip_in,
-                                         out_channels=block_out,
-                                         dropout=dropout, dims=dims, nonlinearity=nonlinearity))
-                block_in = block_out
-                if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
-            up = nn.Module()
-            up.block = block
-            up.attn = attn
-            if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
-                curr_res = curr_res * 2
-            self.up.insert(0, up) # prepend to get consistent order
-
-        # end
-        self.norm_out = self.batchnorm_nd(block_in)
-        self.conv_out = self.conv_nd(block_in,
-                                     out_ch,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
-
-    def forward(self, x, context=None):
-        #assert x.shape[2] == x.shape[3] == self.resolution
-        if context is not None:
-            # assume aligned context, cat along channel axis
-            x = torch.cat((x, context), dim=1)
-
-        # downsampling
-        hs = [self.conv_in(x)]
-        for i_level in range(self.num_resolutions):
-            for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1])
-                if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
-                hs.append(h)
-            if i_level != self.num_resolutions-1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
-
-        # middle
-        h = hs[-1]
-        h = self.mid.block_1(h)
-        # h = self.mid.attn_1(h)
-        h = self.mid.block_2(h)
-
-        # upsampling
-        for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks+1):
-                h = self.up[i_level].block[i_block](
-                    torch.cat([h, hs.pop()], dim=1))
-                if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
-            if i_level != 0:
-                h = self.up[i_level].upsample(h)
-
-        # end
-        h = self.norm_out(h)
-        h = self.nonlinearity(h)
-        h = self.conv_out(h)
-        return h
-
-    def get_last_layer(self):
-        return self.conv_out.weight
-    
-    
-class ResnetBlock(nn.Module):
-    def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
-                 dropout, dims=3, nonlinearity):
-        super().__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-        self.use_conv_shortcut = conv_shortcut
-        self.conv_nd = torch.nn.Conv2d if dims == 2 else torch.nn.Conv3d if dims == 3 else None
-        self.batchnorm_nd = torch.nn.BatchNorm2d if dims == 2 else torch.nn.BatchNorm3d if dims == 3 else None
-
-        self.norm1 = self.batchnorm_nd(in_channels)
-        self.conv1 = self.conv_nd(in_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
-        self.norm2 = self.batchnorm_nd(out_channels)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.conv2 = self.conv_nd(out_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
-        self.nonlin1 = nonlinearity
-        self.nonlin2 = nonlinearity
-        if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                self.conv_shortcut = self.conv_nd(in_channels,
-                                                     out_channels,
-                                                     kernel_size=3,
-                                                     stride=1,
-                                                     padding=1)
-            else:
-                self.nin_shortcut = self.conv_nd(in_channels,
-                                                    out_channels,
-                                                    kernel_size=1,
-                                                    stride=1,
-                                                    padding=0)
-    
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+        assert x.shape[1] == self.channels
+        return self.op(x)
+    
+    
+class Upsample(nn.Module):
+    """
+    An upsampling layer with an optional convolution.
+    :param channels: channels in the inputs and outputs.
+    :param use_conv: a bool determining if a convolution is applied.
+    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+                 upsampling occurs in the inner-two dimensions.
+    """
+
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        if use_conv:
+            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        if self.dims == 3:
+            x = F.interpolate(
+                x, (x.shape[2] * 2, x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+            )
+        else:
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+        
+
+class ResBlock(nn.Module):
+    def __init__(
+        self,
+        channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        dims=2,
+        use_checkpoint=False,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims)
+            self.x_upd = Upsample(channels, False, dims)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims)
+            self.x_upd = Downsample(channels, False, dims)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        """
+        Apply the block to a Tensor, conditioned on a timestep embedding.
+        :param x: an [N x C x ...] Tensor of features.
+        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
+
 
     def _forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = self.nonlin1(h)
-        h = self.conv1(h)
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
 
-        h = self.norm2(h)
-        h = self.nonlin2(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
-
-        if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                x = self.conv_shortcut(x)
-            else:
-                x = self.nin_shortcut(x)
-
-        return x+h
-
-
-class SinNonlinearity(nn.Module):
-    def __init__(self, sinwave=10):
-        self.waves = sinwave
+        h = self.out_layers(h)
+        return self.skip_connection(x) + h
+        
+        
+class UNetModel(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        model_channels,
+        out_channels,
+        num_res_blocks,
+        dropout=0,
+        channel_mult=(1, 2, 4, 8),
+        conv_resample=True,
+        dims=3,
+        use_checkpoint=True,
+        resblock_updown=False,
+        use_zero_module=True,
+    ):
         super().__init__()
-        self.conv = torch.nn.Conv1d(self.waves, 1, 1)
-        self.freq = nn.Parameter(torch.ones((self.waves,)), requires_grad=True)
-    
-    def forward(self, inputs):
-        b, c, h, w, d = inputs.shape
-        inputs = rearrange(inputs, 'b ... -> b 1 (...)')
-        inputs = repeat(inputs, 'b d z -> b (d f) z', f=self.waves)
-        inputs = torch.einsum('bfz,f->bfz', inputs, self.freq).sin()
-        inputs = self.conv(inputs)
-        outputs = rearrange(inputs[:, 0], 'b (c h w d) -> b c h w d', c=c, h=h, w=w, d=d)
-        return outputs
-            
+
+        self.dims = dims
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.dropout = dropout
+        self.channel_mult = channel_mult
+        self.conv_resample = conv_resample
+        self.use_checkpoint = use_checkpoint
+        self.input_blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = model_channels
+        input_block_chans = [model_channels]
+        ch = model_channels
+        ds = 1
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [
+                    ResBlock(
+                        ch,
+                        dropout,
+                        out_channels=mult * model_channels,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                    )
+                ]
+                ch = mult * model_channels
+                self.input_blocks.append(nn.Sequential(*layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(channel_mult) - 1:
+                out_ch = ch
+                self.input_blocks.append(
+                    nn.Sequential(
+                        ResBlock(
+                            ch,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            down=True,
+                        )
+                        if resblock_updown
+                        else Downsample(
+                            ch, conv_resample, dims=dims, out_channels=out_ch
+                        )
+                    )
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                ds *= 2
+                self._feature_size += ch
+
+        self.input_block_chans = copy.deepcopy(input_block_chans)
+        self.middle_block = nn.Sequential(
+            ResBlock(
+                ch,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+            ),
+            ResBlock(
+                ch,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+            for i in range(num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    ResBlock(
+                        ch + ich,
+                        dropout,
+                        out_channels=model_channels * mult,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                    )
+                ]
+                ch = model_channels * mult
+                if level and i == num_res_blocks:
+                    out_ch = ch
+                    layers.append(
+                        ResBlock(
+                            ch,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            up=True,
+                        )
+                        if resblock_updown
+                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+                    )
+                    ds //= 2
+                self.output_blocks.append(nn.Sequential(*layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            normalization(ch),
+            nn.SiLU(),
+            zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1), enabled=use_zero_module),
+        )
+
+    def forward(self, x):
+        hs = []
+        h = x.type(x.dtype)
+        for module in self.input_blocks:
+            h = module(h)
+            hs.append(h)
+        z = self.middle_block(h)
+        for module in self.output_blocks:
+            z = torch.cat([z, hs.pop()], dim=1)
+            z = module(z)
+        z = z.type(x.dtype)
+        z = self.out(z)
+        return z

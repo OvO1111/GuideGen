@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from functools import partial
-import math, copy
+import math, copy, gc
 from typing import Iterable
 
 import numpy as np
@@ -20,7 +20,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
-
+from monai.networks.nets.unet import UNet
 
 # dummy replace
 def convert_module_to_f16(x):
@@ -107,7 +107,9 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
     def forward(self, x, emb, context=None):
         for layer in self:
-            if isinstance(layer, TimestepBlock):
+            if isinstance(layer, TimestepEmbedSequential):
+                x = layer(x, emb, context)
+            elif isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
@@ -534,6 +536,8 @@ class UNetModel(nn.Module):
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
         self.return_latents = return_latents
+        self.context_dim = context_dim
+        self.transformer_depth = transformer_depth
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -727,7 +731,7 @@ class UNetModel(nn.Module):
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, return_latents=False, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -756,7 +760,346 @@ class UNetModel(nn.Module):
             z = th.cat([z, hs.pop()], dim=1)
             z = module(z, emb, context)
         z = z.type(x.dtype)
-        if self.return_latents:
-            return h, self.id_predictor(z) if self.predict_codebook_ids else self.out(z)
+        if return_latents:
+            return (self.id_predictor(z) if self.predict_codebook_ids else self.out(z)), h
         else:
             return self.id_predictor(z) if self.predict_codebook_ids else self.out(z)
+               
+
+class PointDecoder(nn.Module):
+    def __init__(self, dims, channels, no_residual=False, last_op=None):
+        super().__init__()
+
+        conv = nn.Conv1d if dims == 1 else nn.Conv2d
+        self.filters = []
+        self.no_residual = no_residual
+        self.last_op = last_op
+
+        if self.no_residual:
+            for l in range(len(channels) - 1):
+                self.filters.append(conv(
+                    channels[l],
+                    channels[l + 1],
+                    1))
+                self.add_module("conv%d" % l, self.filters[l])
+        else:
+            for l in range(len(channels) - 1):
+                if 0 != l:
+                    self.filters.append(
+                        conv(
+                            channels[l] + channels[0],
+                            channels[l + 1],
+                            1))
+                else:
+                    self.filters.append(conv(
+                        channels[l],
+                        channels[l + 1],
+                        1))
+
+                self.add_module("conv%d" % l, self.filters[l])
+
+    def forward(self, feature):
+        '''
+        :param feature: [B, C_in, N]
+        :return: [B, C_out, N]
+        '''
+        y = feature
+        tmpy = feature
+        for i in range(len(self.filters)):
+            if self.no_residual:
+                y = self._modules['conv' + str(i)](y)
+            else:
+                y = self._modules['conv' + str(i)](
+                    y if i == 0
+                    else th.cat([y, tmpy], 1)
+                )
+            
+            if i != len(self.filters) - 1:
+                y = F.leaky_relu(y)
+
+        if self.last_op:
+            y = self.last_op(y)
+
+        return y
+        
+
+class ConsistentUNetModel(UNetModel):
+    def __init__(self, 
+                 num_views=32,
+                 conv1d_out_chns=64,
+                 feat_out_chns=[1, 8, 16, 8, 1],
+                 **unet_kwargs):
+        super().__init__(**unet_kwargs)
+        self.num_views = num_views
+        self.consistency_blocks = nn.ModuleList()
+        for i_layer, channel_mult in enumerate(self.channel_mult[::-1]):
+            for i_res_block in range(self.num_res_blocks + 1):
+                ch = self.model_channels * channel_mult
+                self.consistency_blocks.append(
+                    ViewConsistencyBlock(
+                        num_views=self.num_views,
+                        ch=ch,
+                        time_embed_dim=self.model_channels * 4,
+                        dropout=self.dropout,
+                        use_checkpoint=self.use_checkpoint,
+                    )
+                )
+        self.n_res = 256
+        self.unet_depth = len(self.channel_mult) * (self.num_res_blocks + 1)
+        # self.conv1d_out = nn.Conv1d(self.model_channels + 1, conv1d_out_chns, kernel_size=3, padding=1)
+        # self.point_decoder = PointDecoder(dims=1, channels=[conv1d_out_chns] + feat_out_chns, no_residual=False, last_op=None)
+        # self.plane_decoder = PointDecoder(dims=2, channels=feat_out_chns, no_residual=False, last_op=None)
+        
+        # self.attn = SpatialTransformer(num_views, n_heads=4, d_head=16, depth=1, context_dim=64, dims=1)
+
+    @staticmethod 
+    def index_2d(feat, uv):
+        # https://zhuanlan.zhihu.com/p/137271718
+        # feat: [B, C, H, W]
+        # uv: [B, N, 2]
+        uv = uv.unsqueeze(2) # [B, N, 1, 2]
+        feat = feat.transpose(2, 3) # [W, H]
+        samples = th.nn.functional.grid_sample(feat, uv, align_corners=True) # [B, C, N, 1]
+        return samples[:, :, :, 0] # [B, C, N]
+    
+    def query_view_feats(self, indices, layer_feats, context=None):
+        # indices: [B M N 2]: B: #batch, M: #view, N: #points, 2: (y, x)
+        # layer_feats: [B M C W H]: B: #batch, M: #view
+        # context: [B M N']
+        # output: merged feats [B C N]
+        indices = indices.unsqueeze(0)
+        context = context.unsqueeze(0)
+        layer_feats = layer_feats.unsqueeze(0)
+        n_view = layer_feats.shape[1]
+        p_feats_list = []
+        for i in range(n_view):
+            feat = layer_feats[:, i, ...] # B, C, W, H
+            p = indices[:, i, ...] # B, N, 2
+            p_feats = self.index_2d(feat, p) # B, C, N
+            p_feats_list.append(p_feats)
+        p_feats = th.stack(p_feats_list, dim=-1) # B, C, N, M
+        # v1
+        # p_feats = th.nn.functional.avg_pool2d(p_feats, (1, p_feats.shape[-1])).squeeze(-1)
+        # v2
+        context_cls = context.mean(-1)[..., 0,]
+        p_feats = th.einsum('b c n m, b m -> b c n', p_feats, context_cls)
+        # v3
+        # p_feats = self.attn(rearrange(p_feats, 'b c n m -> (b n) m c'),
+        #                     context=repeat(rearrange(context, 'b m 1 c-> b m c'), 'b ... -> (b r) ...', r=p_feats.shape[-2]))
+        # p_feats = rearrange(p_feats, '(b n) m c -> b c n m', b=1).mean(-1)
+        return p_feats  # [B, C, N]
+
+    def forward(self,
+                x, 
+                timesteps=None, 
+                context=None, 
+                y=None, 
+                point_indices=None,  # [B N 2]
+                detach_modeling=False,
+                model_3d=False,
+                model_2d=False,
+                use_projector=False,
+                b=1,
+                **kwargs):
+        # unet part
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        hs = []
+        zs = []
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        h = x.type(x.dtype)
+        for module in self.input_blocks:
+            h = module(h, emb, context)
+            hs.append(h)
+        z = self.middle_block(h, emb, context)
+        for module, cons_module in zip(self.output_blocks, self.consistency_blocks):
+            z = th.cat([z, hs.pop()], dim=1)
+            z = module(z, emb, context)
+            z = cons_module(z, emb)
+            zs.append(z)
+        # for module in self.output_blocks:
+        #     z = th.cat([z, hs.pop()], dim=1)
+        #     z = module(z, emb, context)
+        #     zs.append(z)
+        z = z.type(x.dtype)
+        y = self.out(z)  # [B C H W], with C=1
+        
+        # if model_3d:
+        #     # point consistency part
+        #     # recon
+        #     p_feats = self.query_view_feats(
+        #         layer_feats=th.cat([x, y, z], dim=1)[:b],
+        #         indices=point_indices,
+        #         context=context[:b]
+        #     )
+        #     feats = self.conv1d_out(p_feats)  # B C' N
+        #     feats = self.point_decoder(feats)
+        #     # gt
+        #     p_feats_gt = self.query_view_feats(
+        #         layer_feats=th.cat([x, y, z], dim=1)[b:],
+        #         indices=point_indices,
+        #         context=context[b:]
+        #     )
+        #     feats_gt = self.conv1d_out(p_feats_gt)  # B C' N
+        #     feats_gt = self.point_decoder(feats_gt)
+
+        #     return {'image_out': y, 'point_out': feats, 'point_out_gt': feats_gt}
+
+        # if model_2d:
+        #     _y, _z = y, z
+        #     if detach_modeling:
+        #         _y = y.detach()
+        #         _z = z.detach()
+        #     p_feats = self.query_view_feats(
+        #         layer_feats=th.cat([_y, _z], dim=1),
+        #         indices=point_indices,
+        #         context=context
+        #     )
+        #     feats = self.conv1d_out(p_feats)
+        #     # points = self.point_decoder(feats)
+        #     plane = feats.view(1, -1, 256, 256)
+        #     plane = self.plane_decoder(plane)
+            
+        #     return {'image_out': y, 'point_out': None, 'plane_out': plane}
+        return y
+
+
+class ViewConsistencyBlock(nn.Module):
+    def __init__(self,
+                 ch,
+                 num_views,
+                 time_embed_dim,
+                 dropout=0.0,
+                 use_checkpoint=True,
+                 use_scale_shift=False,):
+        super().__init__()
+        self.ch = ch
+        self.num_views = num_views
+        self.conv_3d = ResBlock(ch,
+                                time_embed_dim,
+                                dropout=dropout,
+                                out_channels=ch,
+                                dims=3,
+                                use_checkpoint=use_checkpoint,
+                                use_scale_shift_norm=use_scale_shift)
+    
+    def forward(self, x, emb):
+        # x [(B M) C H W]
+        x = rearrange(x, '(b m) c h w -> b c m h w', m=self.num_views)
+        emb = rearrange(emb, '(b m) c -> b c m', m=self.num_views).mean(-1)
+        x = self.conv_3d(x, emb)
+        x = rearrange(x, 'b c m h w -> (b m) c h w')
+        return x
+
+
+class ConsistentUNetModelV2(UNetModel):
+    def __init__(self, 
+                 num_views=16,
+                 **unet_kwargs):
+        super().__init__(**unet_kwargs)
+        self.num_views = num_views
+        self.consistency_blocks = nn.ModuleList()
+
+    def forward(self,
+                x, 
+                timesteps=None, 
+                context=None, 
+                y=None, 
+                context_target=None,
+                **kwargs):
+        # unet part
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        hs = []
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        if context_target is None:
+            context_target = context
+
+        h = x.type(x.dtype)
+        for module in self.input_blocks:
+            h = module(h, emb, context)
+            hs.append(h)
+        z = self.middle_block(h, emb, context)
+        # only modify the decoder half
+        for module, cons in zip(self.output_blocks, self.consistency_blocks):
+            z = th.cat([z, hs.pop()], dim=1)
+            z = module(z, emb, context_target)
+            z = cons(z, emb,)
+        z = z.type(x.dtype)
+        z = self.out(z)  # [B C H W], with C=1
+        return z
+
+    
+class R2GaussianConsistencyUNetModel(UNetModel):
+    def __init__(self, 
+                 num_views=16,
+                 **unet_kwargs):
+        super().__init__(**unet_kwargs)
+        self.num_views = num_views
+        self.consistency_blocks = nn.ModuleList()
+        self.r2gaussian_encoder = UNet(spatial_dims=2,
+                                       in_channels=1,
+                                       out_channels=16,
+                                       channels=(16, 32, 64, 128),
+                                       strides=(2, 2, 2))
+        self.r2gaussian_xyz = nn.Conv2d(16, 3, kernel_size=1)
+        self.r2gaussian_density = nn.Conv2d(16, 1, kernel_size=1)
+        self.r2gaussian_scaling = nn.Conv2d(16, 3, kernel_size=1)
+        self.r2gaussian_rot = nn.Conv2d(16, 4, kernel_size=1)
+
+    def forward(self,
+                x, 
+                timesteps=None, 
+                context=None, 
+                y=None, 
+                context_target=None,
+                detach_modeling=False,
+                **kwargs):
+        # unet part
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        hs = []
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        if context_target is None:
+            context_target = context
+
+        h = x.type(x.dtype)
+        for module in self.input_blocks:
+            h = module(h, emb, context)
+            hs.append(h)
+        z = self.middle_block(h, emb, context)
+        # only modify the decoder half
+        for module in self.output_blocks:
+            z = th.cat([z, hs.pop()], dim=1)
+            z = module(z, emb, context_target)
+        z = z.type(x.dtype)
+        z = self.out(z)  # [B C H W], with C=1
+
+        zg = self.r2gaussian_encoder(z.mean(0, keepdim=True), )
+        zg_xyz = self.r2gaussian_xyz(zg)
+        zg_density = self.r2gaussian_density(zg)
+        zg_scaling = self.r2gaussian_scaling(zg)
+        zg_rot = self.r2gaussian_rot(zg)
+        
+        return {'image_out': z, 'xyz': zg_xyz, 'density': zg_density, 'scaling': zg_scaling, 'rot': zg_rot}

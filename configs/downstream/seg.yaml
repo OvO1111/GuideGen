@@ -22,27 +22,39 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 1
-    num_workers: 4
+    batch_size: 2
+    num_workers: 16
     wrap: False
     train:
-      target: ldm.data.nnunet.nnUNetLikeDataset
+      target: ldm.data.base.MSDDataset
       params:
-        dataset_base: /ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset105_normalloss
         split: train
-        fold: 1
+        # max_size: 2
+        output_size: [256, 256, 256]
+        base_dir: 
+          - /home/dlr/data/datasets/msd_hepaticvessel
+        transforms:
+          torchio.RescaleIntensity:
+            in_min_max: [-100, 100]
+            out_min_max: [-1, 1]
+          torchio.RemapLabels:
+            remapping: 
+              2: 0
     validation:
-      target: ldm.data.nnunet.nnUNetLikeDataset
+      target: ldm.data.base.MSDDataset
       params:
-        dataset_base: /ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset105_normalloss
         split: val
-        fold: 1
-    test:
-      target: ldm.data.nnunet.nnUNetLikeDataset
-      params:
-        dataset_base: /ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset105_normalloss
-        split: val
-        fold: 1
+        max_size: 10
+        output_size: [256, 256, 256]
+        base_dir: 
+          - /home/dlr/data/datasets/msd_hepaticvessel
+        transforms:
+          torchio.RescaleIntensity:
+            in_min_max: [-100, 100]
+            out_min_max: [-1, 1]
+          torchio.RemapLabels:
+            remapping: 
+              2: 0
 
 lightning:
   callbacks:

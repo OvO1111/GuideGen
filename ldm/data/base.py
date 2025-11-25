@@ -30,6 +30,7 @@ from monai.transforms import (
 from monai.data.dataset import CacheDataset
 from torch.utils.data import default_collate, Dataset
 from ldm.data.utils import LabelParser, OrganTypeBase, TorchioForegroundCropper
+from ldm.util import instantiate_from_config
 
 
 def read_text(path, process_fn=lambda x: x):
@@ -160,9 +161,10 @@ class DummyDataset(Dataset):
         
 class MSDDataset(Dataset):
     def __init__(self, base_dir, split='train',
-                 output_size=(128, 512, 512), max_size=None):
+                 output_size=(128, 512, 512), max_size=None, **kw):
         self.split = split
         self.base_dir = base_dir
+        self.output_size = tuple(output_size)
         self.ds = {'train': [], 'val': [], 'test': []}
         super().__init__()
         
@@ -170,7 +172,11 @@ class MSDDataset(Dataset):
             self.base_dir = [self.base_dir]
             
         for dir in self.base_dir:
-            with open(os.path.join(dir, 'train.txt')) as f1, open(os.path.join(dir, 'val.txt')) as f2, open(os.path.join(dir, 'test.txt')) as f3:
+            if not os.path.exists(dir):
+                dir = dir.replace("dlr/", "")  # for container testing
+                if not os.path.exists(dir): raise FileNotFoundError(f"Directory {dir} does not exist.")
+                
+            with open(os.path.join(dir, 'train.list')) as f1, open(os.path.join(dir, 'val.list')) as f2, open(os.path.join(dir, 'test.list')) as f3:
                 self.ds['train'].extend([os.path.join(dir, x.strip()) for x in f1.readlines()])
                 self.ds['val'].extend([os.path.join(dir, x.strip()) for x in f2.readlines()])
                 self.ds['test'].extend([os.path.join(dir, x.strip()) for x in f3.readlines()])
@@ -178,10 +184,22 @@ class MSDDataset(Dataset):
         self.ds = {k: [_.strip() for _ in v] for k, v in self.ds.items()}
         self.split_ds = self.ds[self.split][:max_size]
         
-        self.load_fn = lambda x: GetArrayFromImage(ReadImage(x))
-        self.transforms = {
-            "resize": tio.Resize(output_size, image_interpolation='trilinear', label_interpolation='nearest'),
-        }
+        if 'transforms' in kw: 
+            self.transforms = tio.Compose([
+                instantiate_from_config({'target': key, 'params': value})
+                for key, value in kw['transforms'].items()
+            ])
+        else:
+            self.transforms = tio.Compose([
+                tio.Resize(output_size),
+                tio.RescaleIntensity(out_min_max=(-1, 1), in_min_max=(-1000, 1000)),
+            ])
+        
+    def load_fn(self, path):
+        if not os.path.exists(path):
+            return None
+        else:
+            return GetArrayFromImage(ReadImage(path))
         
     def __len__(self):
         return len(self.split_ds)
@@ -191,8 +209,10 @@ class MSDDataset(Dataset):
         dirname, basename = os.path.dirname(path), os.path.basename(path)
         if basename.endswith('.nii.gz'): basename = basename[:-7]
         
-        image = self.load_fn(os.path.join(dirname, 'imagesTr', basename + '_0000.nii.gz'))
-        label = self.load_fn(os.path.join(dirname, 'labelsTr', basename + '.nii.gz'))
+        suffix = 'Tr' if self.split != 'test' else 'Ts'
+        image = self.load_fn(os.path.join(dirname, 'images' + suffix, basename + '.nii.gz'))
+        label = self.load_fn(os.path.join(dirname, 'labels' + suffix, basename + '.nii.gz'))
+        if label is None: label = np.zeros_like(image, dtype=np.uint8)
         
         sample = {"image": image, "label": label}
                 
@@ -201,7 +221,9 @@ class MSDDataset(Dataset):
             label=tio.LabelMap(tensor=torch.tensor(sample['label'][None].astype(np.int64))),
         )
         subject = self.transforms(subject)
-        sample = {k: v.data for k, v in subject.items()}
+        sample = \
+            {k: v.data for k, v in subject.items()} |\
+            {"casename": path}
         
         return sample
         

@@ -5,13 +5,12 @@ model:
     monitor: val/reconstruction_loss
     image_key: image
     embed_dim: 4
-    # n_embed: 8192
     use_window_norm_in_forward: false
     dims: 3
     lossconfig:
       target: ldm.modules.losses.LPIPSWithDiscriminator
       params:
-        disc_start: 20001
+        disc_start: 10001
         disc_weight: 0.5
         gan_feat_weight: 1.
         n_frames_to_select: 3  # 1 as in medicaldiffusion
@@ -19,33 +18,41 @@ model:
     ddconfig:
       double_z: false
       z_channels: 4
-      resolution: [128, 512, 512]
+      resolution: [256, 256]
       in_channels: 1
       out_ch: 1
-      ch: 4
-      ch_mult: [ 1, 1, 2 ]  
+      ch: 8
+      ch_mult: [ 1, 2, 4 ]  
       num_res_blocks: 2
       attn_resolutions: []
       dropout: 0.0
       attn_type: none
 
+  test_only_params:
+    ckpt_path: /home/dlr/data/ldm/aekl_256_256_256/checkpoints/last.ckpt
+
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 2
-    num_workers: 4
+    batch_size: 1
+    num_workers: 2
     wrap: False
+    common:
+      params:
+        data_dir: /hot_data/dlr/datasets/synthetic/projs_set0701
     train:
-      target: ldm.data.base.MSDDataset
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
       params:
         split: train
-        base_dir: ~/data/datasets/msd_colon
     validation:
-      target: ldm.data.base.MSDDataset
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
       params:
         split: val
-        max_size: 50
-        base_dir: ~/data/datasets/msd_colon
+        max_size: 10
+    # test:
+    #   target: ldm.data.make_dataset.from_latents.LatentsDataset
+    #   params:
+    #     split: test
 
 lightning:
   callbacks:

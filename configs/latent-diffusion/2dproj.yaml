@@ -1,0 +1,155 @@
+model:
+  base_learning_rate: 5.e-6
+  train_target: ldm.models.diffusion.ddpm.ProjectionDiffusion2D
+  test_target: inference.models.InferLatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l2
+    # first_stage_key: image
+    first_stage_key: o
+    label_key: index_raw
+    cond_stage_key: index
+    conditioning_key: crossattn
+    image_size: [256, 256]  # after first-stage encoding, infer size
+    channels: 1               # after first-stage encoding
+    monitor: val/loss_simple
+    cond_stage_trainable: false
+    l_simple_weight: 1
+    use_ema: false
+
+    projector_config:
+      target: projectors.leaptorch.LeaptorchProjectorWrapper
+      params:
+        geometry:
+          target: ldm.data.make_dataset.settings.Geometry
+          params:
+            mode: 'parallel'
+            distance_source_detector: 7
+            distance_source_origin: 5
+            n_detector: [256, 256]
+            s_detector: [2, 2]
+            n_voxel: [256, 256, 256]
+            s_voxel: [2, 2, 2]
+            offset_origin: [0, 0, 0]
+            offset_detector: [0, 0]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        in_channels: 1
+        out_channels: 1
+        model_channels: 64
+        attention_resolutions: [8, 16]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 8, 8]
+        num_head_channels: 64
+        use_checkpoint: true  # always use ckpt
+        dims: 2
+        use_spatial_transformer: true
+        context_dim: 64
+
+    first_stage_config:
+      target: ldm.modules.encoders.modules.IdentityFirstStage
+
+    normalizer_config: 
+      target: ldm.data.make_dataset.from_latents.ProjectionNorm
+      params:
+        pm: 0.8e5
+        pM: 3.8e5
+        om: -1
+        oM: 1
+
+    # first_stage_config:
+    #   target: ldm.models.autoencoder.AutoencoderKL
+    #   params:
+    #     monitor: val/reconstruction_loss
+    #     image_key: image
+    #     embed_dim: 4
+    #     # n_embed: 8192
+    #     dims: 3
+    #     lossconfig:
+    #       target: torch.nn.Identity
+    #     ckpt_path: /home/dlr/data/ldm/aekl_256_256_256/checkpoints/last.ckpt
+
+    #     ddconfig:
+    #       double_z: false
+    #       z_channels: 4
+    #       resolution: [256, 256, 256]
+    #       in_channels: 1
+    #       out_ch: 1
+    #       ch: 8
+    #       ch_mult: [ 1, 2, 4 ]  
+    #       num_res_blocks: 2
+    #       attn_resolutions: []
+    #       dropout: 0.0
+    #       attn_type: none
+
+    cond_stage_config:
+      # target: ldm.modules.encoders.modules.TransformerEmbedder
+      # params:
+      #   n_embed: 32
+      #   n_layer: 2
+      #   vocab_size: 360
+      #   use_pos_emb: false
+      target: ldm.modules.encoders.modules.AngleEmbedder
+      params:
+        embed_angles: [0, 90, 180, 270]
+        d_embed: 64
+
+  test_only_params:
+    ckpt_path: $path
+    save_dataset: true 
+    save_dataset_path: $path
+    suffix_keys: 
+      samples: .nii.gz
+      mask: .nii.gz
+          
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 2
+    wrap: False
+    common:
+      params:
+        data_dir: /hot_data/dlr/datasets/synthetic/projs_set0701
+    train:
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
+      params:
+        split: train
+    validation:
+      target: ldm.data.make_dataset.from_latents.LatentsDataset
+      params:
+        split: val
+        max_size: 10
+    # test:
+    #   target: ldm.data.make_dataset.from_latents.LatentsDataset
+    #   params:
+    #     split: test
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        train_batch_frequency: 200
+        max_images: 10
+        log_images_kwargs: 
+          ddim_steps: 50
+        logger:
+          samples:
+            target: image_rescale
+          inputs:
+            target: image_rescale
+          fbp:
+            target: image_rescale
+
+  trainer:
+    benchmark: true
+    max_epochs: 1000
+    replace_sampler_ddp: true
+    limit_test_batches: 500

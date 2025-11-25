@@ -9,7 +9,6 @@ from copy import deepcopy
 from einops import rearrange
 from glob import glob
 import numpy as np
-from natsort import natsorted
 
 from ldm.modules.encoders.modules import TransformerEmbedder
 from ldm.modules.diffusionmodules.model import Encoder

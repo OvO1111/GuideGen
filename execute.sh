@@ -1,0 +1,6 @@
+#!/bin/sh
+# export exp=cmu_swinunetr ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=swinunetr"
+# export exp=cmu_unetpp ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=unetpp"
+# export exp=cmu_vnet ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=vnet"
+# export exp=run_exp ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "/ailab/user/dailinrui/.conda/envs/ldm/bin/python /ailab/user/dailinrui-hdd/code/latentdiffusion/ldm/data/guidegen.py"
+export CUDA_VISIBLE_DEVICES=0,1,2,3 ; torchrun --nproc-per-node=4 main.py -b ./configs/autoencoder/ae.yaml --name aekl_128_512_512 -t --debug

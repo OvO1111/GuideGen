@@ -7,9 +7,9 @@ https://github.com/CompVis/taming-transformers
 """
 
 import torch
+import random
 import torch.nn as nn
 import numpy as np
-import SimpleITK as sitk
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
@@ -22,10 +22,17 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from ldm.util import log_txt_as_img, exists, default, isimage, mean_flat, count_params, instantiate_from_config, set_precision
 from ldm.modules.ema import LitEma
+from ldm.data.make_dataset.settings import *
 from ldm.models.diffusion.sampling.ddim import DDIMSampler
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL, Decoder
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+
+try:
+    from leaptorch import Projector
+    IS_LEAP_AVAILABLE = True
+except ImportError:
+    IS_LEAP_AVAILABLE = False
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -73,6 +80,7 @@ class DDPM(pl.LightningModule):
                  use_positional_encodings=False,
                  learn_logvar=False,
                  logvar_init=0.,
+                 **kwargs
                  ):
         super().__init__()
         assert parameterization in ["eps", "x0"], 'currently only supporting "eps" and "x0"'
@@ -145,6 +153,9 @@ class DDPM(pl.LightningModule):
         self.register_buffer('betas', to_torch(betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        sigmas = np.sqrt((1 - alphas_cumprod_prev) / (1 - alphas_cumprod) * (1 - alphas_cumprod / alphas_cumprod_prev))
+        self.register_buffer('ddim_sigmas_for_original_num_steps', to_torch(sigmas))
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
@@ -353,11 +364,12 @@ class DDPM(pl.LightningModule):
     def training_step(self, batch, batch_idx, optimizer_idx=0):
         loss, loss_dict = self.shared_step(batch)
 
-        self.log_dict(loss_dict, prog_bar=True,
+        self.log_dict(loss_dict, prog_bar=False,
                       logger=True, on_step=True, on_epoch=True)
 
+        self.log("loss_train", loss_dict['train/loss'], prog_bar=True, logger=False, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step,
-                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
+                 prog_bar=False, logger=True, on_step=True, on_epoch=False)
 
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
@@ -371,8 +383,9 @@ class DDPM(pl.LightningModule):
         with self.ema_scope():
             _, loss_dict_ema = self.shared_step(batch)
             loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+            self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log("loss_validation", loss_dict_no_ema['val/loss'], prog_bar=True, logger=False, on_step=False, on_epoch=True)
         self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
     def on_train_batch_end(self, *args, **kwargs):
         if self.use_ema:
@@ -585,95 +598,6 @@ class LatentDiffusion(DDPM):
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
 
-    def meshgrid(self, h, w):
-        y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
-        x = torch.arange(0, w).view(1, w, 1).repeat(h, 1, 1)
-
-        arr = torch.cat([y, x], dim=-1)
-        return arr
-
-    def delta_border(self, h, w):
-        """
-        :param h: height
-        :param w: width
-        :return: normalized distance to image border,
-         wtith min distance = 0 at border and max dist = 0.5 at image center
-        """
-        lower_right_corner = torch.tensor([h - 1, w - 1]).view(1, 1, 2)
-        arr = self.meshgrid(h, w) / lower_right_corner
-        dist_left_up = torch.min(arr, dim=-1, keepdims=True)[0]
-        dist_right_down = torch.min(1 - arr, dim=-1, keepdims=True)[0]
-        edge_dist = torch.min(torch.cat([dist_left_up, dist_right_down], dim=-1), dim=-1)[0]
-        return edge_dist
-
-    def get_weighting(self, h, w, Ly, Lx, device):
-        weighting = self.delta_border(h, w)
-        weighting = torch.clip(weighting, self.split_input_params["clip_min_weight"],
-                               self.split_input_params["clip_max_weight"], )
-        weighting = weighting.view(1, h * w, 1).repeat(1, 1, Ly * Lx).to(device)
-
-        if self.split_input_params["tie_braker"]:
-            L_weighting = self.delta_border(Ly, Lx)
-            L_weighting = torch.clip(L_weighting,
-                                     self.split_input_params["clip_min_tie_weight"],
-                                     self.split_input_params["clip_max_tie_weight"])
-
-            L_weighting = L_weighting.view(1, 1, Ly * Lx).to(device)
-            weighting = weighting * L_weighting
-        return weighting
-
-    def get_fold_unfold(self, x, kernel_size, stride, uf=1, df=1):  # todo load once not every time, shorten code
-        """
-        :param x: img of size (bs, c, h, w)
-        :return: n img crops of size (n, bs, c, kernel_size[0], kernel_size[1])
-        """
-        bs, nc, h, w = x.shape
-
-        # number of crops in image
-        Ly = (h - kernel_size[0]) // stride[0] + 1
-        Lx = (w - kernel_size[1]) // stride[1] + 1
-
-        if uf == 1 and df == 1:
-            fold_params = dict(kernel_size=kernel_size, dilation=1, padding=0, stride=stride)
-            unfold = torch.nn.Unfold(**fold_params)
-
-            fold = torch.nn.Fold(output_size=x.shape[2:], **fold_params)
-
-            weighting = self.get_weighting(kernel_size[0], kernel_size[1], Ly, Lx, x.device).to(x.dtype)
-            normalization = fold(weighting).view(1, 1, h, w)  # normalizes the overlap
-            weighting = weighting.view((1, 1, kernel_size[0], kernel_size[1], Ly * Lx))
-
-        elif uf > 1 and df == 1:
-            fold_params = dict(kernel_size=kernel_size, dilation=1, padding=0, stride=stride)
-            unfold = torch.nn.Unfold(**fold_params)
-
-            fold_params2 = dict(kernel_size=(kernel_size[0] * uf, kernel_size[0] * uf),
-                                dilation=1, padding=0,
-                                stride=(stride[0] * uf, stride[1] * uf))
-            fold = torch.nn.Fold(output_size=(x.shape[2] * uf, x.shape[3] * uf), **fold_params2)
-
-            weighting = self.get_weighting(kernel_size[0] * uf, kernel_size[1] * uf, Ly, Lx, x.device).to(x.dtype)
-            normalization = fold(weighting).view(1, 1, h * uf, w * uf)  # normalizes the overlap
-            weighting = weighting.view((1, 1, kernel_size[0] * uf, kernel_size[1] * uf, Ly * Lx))
-
-        elif df > 1 and uf == 1:
-            fold_params = dict(kernel_size=kernel_size, dilation=1, padding=0, stride=stride)
-            unfold = torch.nn.Unfold(**fold_params)
-
-            fold_params2 = dict(kernel_size=(kernel_size[0] // df, kernel_size[0] // df),
-                                dilation=1, padding=0,
-                                stride=(stride[0] // df, stride[1] // df))
-            fold = torch.nn.Fold(output_size=(x.shape[2] // df, x.shape[3] // df), **fold_params2)
-
-            weighting = self.get_weighting(kernel_size[0] // df, kernel_size[1] // df, Ly, Lx, x.device).to(x.dtype)
-            normalization = fold(weighting).view(1, 1, h // df, w // df)  # normalizes the overlap
-            weighting = weighting.view((1, 1, kernel_size[0] // df, kernel_size[1] // df, Ly * Lx))
-
-        else:
-            raise NotImplementedError
-
-        return fold, unfold, normalization, weighting
-
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None):
@@ -697,7 +621,9 @@ class LatentDiffusion(DDPM):
                     xc = {"c_crossattn": super(LatentDiffusion, self).get_input(batch, cond_key['crossattn']),
                           "c_concat": super(LatentDiffusion, self).get_input(batch, cond_key['concat']) }
                 else:
-                    xc = super().get_input(batch, cond_key).to(self.device)
+                    xc = super().get_input(batch, cond_key)
+                    if isinstance(xc, torch.Tensor): xc = xc.to(self.device)
+                    else: xc = [_.to(self.device) for _ in xc]
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
@@ -740,55 +666,10 @@ class LatentDiffusion(DDPM):
 
         z = 1. / self.scale_factor * z
 
-        if hasattr(self, "split_input_params"):
-            if self.split_input_params["patch_distributed_vq"]:
-                ks = self.split_input_params["ks"]  # eg. (128, 128)
-                stride = self.split_input_params["stride"]  # eg. (64, 64)
-                uf = self.split_input_params["vqf"]
-                bs, nc, h, w = z.shape
-                if ks[0] > h or ks[1] > w:
-                    ks = (min(ks[0], h), min(ks[1], w))
-                    print("reducing Kernel")
-
-                if stride[0] > h or stride[1] > w:
-                    stride = (min(stride[0], h), min(stride[1], w))
-                    print("reducing stride")
-
-                fold, unfold, normalization, weighting = self.get_fold_unfold(z, ks, stride, uf=uf)
-
-                z = unfold(z)  # (bn, nc * prod(**ks), L)
-                # 1. Reshape to img shape
-                z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-
-                # 2. apply model loop over last dim
-                if isinstance(self.first_stage_model, VQModelInterface):
-                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i], c,
-                                                                 force_not_quantize=predict_cids or force_not_quantize)
-                                   for i in range(z.shape[-1])]
-                else:
-
-                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i])
-                                   for i in range(z.shape[-1])]
-
-                o = torch.stack(output_list, axis=-1)  # # (bn, nc, ks[0], ks[1], L)
-                o = o * weighting
-                # Reverse 1. reshape to img shape
-                o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-                # stitch crops together
-                decoded = fold(o)
-                decoded = decoded / normalization  # norm is shape (1, 1, h, w)
-                return decoded
-            else:
-                if isinstance(self.first_stage_model, VQModelInterface):
-                    return self.first_stage_model.decode(z, c, force_not_quantize=predict_cids or force_not_quantize)
-                else:
-                    return self.first_stage_model.decode(z, c)
-
+        if isinstance(self.first_stage_model, VQModelInterface):
+            return self.first_stage_model.decode(z, c, force_not_quantize=predict_cids or force_not_quantize)
         else:
-            if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(z, c, force_not_quantize=predict_cids or force_not_quantize)
-            else:
-                return self.first_stage_model.decode(z, c)
+            return self.first_stage_model.decode(z, c)
 
     # same as above but without decorator
     def differentiable_decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
@@ -800,95 +681,14 @@ class LatentDiffusion(DDPM):
 
         z = 1. / self.scale_factor * z
 
-        if hasattr(self, "split_input_params"):
-            if self.split_input_params["patch_distributed_vq"]:
-                ks = self.split_input_params["ks"]  # eg. (128, 128)
-                stride = self.split_input_params["stride"]  # eg. (64, 64)
-                uf = self.split_input_params["vqf"]
-                bs, nc, h, w = z.shape
-                if ks[0] > h or ks[1] > w:
-                    ks = (min(ks[0], h), min(ks[1], w))
-                    print("reducing Kernel")
-
-                if stride[0] > h or stride[1] > w:
-                    stride = (min(stride[0], h), min(stride[1], w))
-                    print("reducing stride")
-
-                fold, unfold, normalization, weighting = self.get_fold_unfold(z, ks, stride, uf=uf)
-
-                z = unfold(z)  # (bn, nc * prod(**ks), L)
-                # 1. Reshape to img shape
-                z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-
-                # 2. apply model loop over last dim
-                if isinstance(self.first_stage_model, VQModelInterface):  
-                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i],
-                                                                 force_not_quantize=predict_cids or force_not_quantize)
-                                   for i in range(z.shape[-1])]
-                else:
-
-                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i])
-                                   for i in range(z.shape[-1])]
-
-                o = torch.stack(output_list, axis=-1)  # # (bn, nc, ks[0], ks[1], L)
-                o = o * weighting
-                # Reverse 1. reshape to img shape
-                o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-                # stitch crops together
-                decoded = fold(o)
-                decoded = decoded / normalization  # norm is shape (1, 1, h, w)
-                return decoded
-            else:
-                if isinstance(self.first_stage_model, VQModelInterface):
-                    return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
-                else:
-                    return self.first_stage_model.decode(z)
-
+        if isinstance(self.first_stage_model, VQModelInterface):
+            return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
         else:
-            if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
-            else:
-                return self.first_stage_model.decode(z)
+            return self.first_stage_model.decode(z)
 
     @torch.no_grad()
     def encode_first_stage(self, x, c=None):
-        if hasattr(self, "split_input_params"):
-            if self.split_input_params["patch_distributed_vq"]:
-                ks = self.split_input_params["ks"]  # eg. (128, 128)
-                stride = self.split_input_params["stride"]  # eg. (64, 64)
-                df = self.split_input_params["vqf"]
-                self.split_input_params['original_image_size'] = x.shape[-2:]
-                bs, nc, h, w = x.shape
-                if ks[0] > h or ks[1] > w:
-                    ks = (min(ks[0], h), min(ks[1], w))
-                    print("reducing Kernel")
-
-                if stride[0] > h or stride[1] > w:
-                    stride = (min(stride[0], h), min(stride[1], w))
-                    print("reducing stride")
-
-                fold, unfold, normalization, weighting = self.get_fold_unfold(x, ks, stride, df=df)
-                z = unfold(x)  # (bn, nc * prod(**ks), L)
-                # Reshape to img shape
-                z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-
-                output_list = [self.first_stage_model.encode(z[:, :, :, :, i])
-                               for i in range(z.shape[-1])]
-
-                o = torch.stack(output_list, axis=-1)
-                o = o * weighting
-
-                # Reverse reshape to img shape
-                o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-                # stitch crops together
-                decoded = fold(o)
-                decoded = decoded / normalization
-                return decoded
-
-            else:
-                return self.first_stage_model.encode(x, c)
-        else:
-            return self.first_stage_model.encode(x, c)
+        return self.first_stage_model.encode(x, c)
 
     def shared_step(self, batch, **kwargs):
         x, c = self.get_input(batch, self.first_stage_key)
@@ -916,7 +716,7 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, **kw):
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
@@ -927,92 +727,7 @@ class LatentDiffusion(DDPM):
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
             cond = {key: cond}
 
-        if hasattr(self, "split_input_params"):
-            assert len(cond) == 1  # todo can only deal with one conditioning atm
-            assert not return_ids  
-            ks = self.split_input_params["ks"]  # eg. (128, 128)
-            stride = self.split_input_params["stride"]  # eg. (64, 64)
-
-            h, w = x_noisy.shape[-2:]
-
-            fold, unfold, normalization, weighting = self.get_fold_unfold(x_noisy, ks, stride)
-
-            z = unfold(x_noisy)  # (bn, nc * prod(**ks), L)
-            # Reshape to img shape
-            z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-            z_list = [z[:, :, :, :, i] for i in range(z.shape[-1])]
-
-            if self.cond_stage_key in ["image", "LR_image", "segmentation",
-                                       'bbox_img'] and self.model.conditioning_key:  # todo check for completeness
-                c_key = next(iter(cond.keys()))  # get key
-                c = next(iter(cond.values()))  # get value
-                assert (len(c) == 1)  # todo extend to list with more than one elem
-                c = c[0]  # get element
-
-                c = unfold(c)
-                c = c.view((c.shape[0], -1, ks[0], ks[1], c.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-
-                cond_list = [{c_key: [c[:, :, :, :, i]]} for i in range(c.shape[-1])]
-
-            elif self.cond_stage_key == 'coordinates_bbox':
-                assert 'original_image_size' in self.split_input_params, 'BoudingBoxRescaling is missing original_image_size'
-
-                # assuming padding of unfold is always 0 and its dilation is always 1
-                n_patches_per_row = int((w - ks[0]) / stride[0] + 1)
-                full_img_h, full_img_w = self.split_input_params['original_image_size']
-                # as we are operating on latents, we need the factor from the original image size to the
-                # spatial latent size to properly rescale the crops for regenerating the bbox annotations
-                num_downs = self.first_stage_model.encoder.num_resolutions - 1
-                rescale_latent = 2 ** (num_downs)
-
-                # get top left postions of patches as conforming for the bbbox tokenizer, therefore we
-                # need to rescale the tl patch coordinates to be in between (0,1)
-                tl_patch_coordinates = [(rescale_latent * stride[0] * (patch_nr % n_patches_per_row) / full_img_w,
-                                         rescale_latent * stride[1] * (patch_nr // n_patches_per_row) / full_img_h)
-                                        for patch_nr in range(z.shape[-1])]
-
-                # patch_limits are tl_coord, width and height coordinates as (x_tl, y_tl, h, w)
-                patch_limits = [(x_tl, y_tl,
-                                 rescale_latent * ks[0] / full_img_w,
-                                 rescale_latent * ks[1] / full_img_h) for x_tl, y_tl in tl_patch_coordinates]
-                # patch_values = [(np.arange(x_tl,min(x_tl+ks, 1.)),np.arange(y_tl,min(y_tl+ks, 1.))) for x_tl, y_tl in tl_patch_coordinates]
-
-                # tokenize crop coordinates for the bounding boxes of the respective patches
-                patch_limits_tknzd = [torch.LongTensor(self.bbox_tokenizer._crop_encoder(bbox))[None].to(self.device)
-                                      for bbox in patch_limits]  # list of length l with tensors of shape (1, 2)
-                print(patch_limits_tknzd[0].shape)
-                # cut tknzd crop position from conditioning
-                assert isinstance(cond, dict), 'cond must be dict to be fed into model'
-                cut_cond = cond['c_crossattn'][0][..., :-2].to(self.device)
-                print(cut_cond.shape)
-
-                adapted_cond = torch.stack([torch.cat([cut_cond, p], dim=1) for p in patch_limits_tknzd])
-                adapted_cond = rearrange(adapted_cond, 'l b n -> (l b) n')
-                print(adapted_cond.shape)
-                adapted_cond = self.get_learned_conditioning(adapted_cond)
-                print(adapted_cond.shape)
-                adapted_cond = rearrange(adapted_cond, '(l b) n d -> l b n d', l=z.shape[-1])
-                print(adapted_cond.shape)
-
-                cond_list = [{'c_crossattn': [e]} for e in adapted_cond]
-
-            else:
-                cond_list = [cond for i in range(z.shape[-1])]  # Todo make this more efficient
-
-            # apply model by loop over crops
-            output_list = [self.model(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
-            assert not isinstance(output_list[0],
-                                  tuple)  # todo cant deal with multiple model outputs check this never happens
-
-            o = torch.stack(output_list, axis=-1)
-            o = o * weighting
-            # Reverse reshape to img shape
-            o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-            # stitch crops together
-            x_recon = fold(o) / normalization
-
-        else:
-            x_recon = self.model(x_noisy, t, **cond)
+        x_recon = self.model(x_noisy, t, **cond, **kw)
 
         # if isinstance(x_recon, tuple) and not return_ids:
         #     return x_recon[0]
@@ -1074,9 +789,18 @@ class LatentDiffusion(DDPM):
         return loss, loss_dict
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
-                        return_x0=False, score_corrector=None, corrector_kwargs=None):
+                        return_x0=False, score_corrector=None, corrector_kwargs=None, max_batch=None):
         t_in = t
-        model_out = self.apply_model(x, t_in, c, return_ids=return_codebook_ids)
+        if max_batch is None or x.shape[0] < max_batch:
+            model_out = self.apply_model(x, t_in, c, return_ids=return_codebook_ids)
+        else:
+            model_out = []
+            for i in range(0, x.shape[0], max_batch):
+                x_batch = x[i:i + max_batch]
+                t_batch = t_in[i:i + max_batch]
+                c_batch = c[i:i + max_batch] if isinstance(c, torch.Tensor) else c
+                model_out.append(self.apply_model(x_batch, t_batch, c_batch, return_ids=return_codebook_ids))
+            model_out = torch.cat(model_out, dim=0)
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
@@ -1107,13 +831,13 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def p_sample(self, x, c, t, clip_denoised=False, repeat_noise=False,
                  return_codebook_ids=False, quantize_denoised=False, return_x0=False,
-                 temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None):
+                 temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None, max_batch=None):
         b, *_, device = *x.shape, x.device
         outputs = self.p_mean_variance(x=x, c=c, t=t, clip_denoised=clip_denoised,
                                        return_codebook_ids=return_codebook_ids,
                                        quantize_denoised=quantize_denoised,
                                        return_x0=return_x0,
-                                       score_corrector=score_corrector, corrector_kwargs=corrector_kwargs)
+                                       score_corrector=score_corrector, corrector_kwargs=corrector_kwargs, max_batch=max_batch)
         if return_codebook_ids:
             # raise DeprecationWarning("Support dropped.")
             model_mean, _, model_log_variance, logits = outputs
@@ -1139,7 +863,7 @@ class LatentDiffusion(DDPM):
     def progressive_denoising(self, cond, shape, verbose=True, callback=None, quantize_denoised=False,
                               img_callback=None, mask=None, x0=None, temperature=1., noise_dropout=0.,
                               score_corrector=None, corrector_kwargs=None, batch_size=None, x_T=None, start_T=None,
-                              log_every_t=None):
+                              log_every_t=None, max_batch=None):
         if not log_every_t:
             log_every_t = self.log_every_t
         timesteps = self.num_timesteps
@@ -1179,7 +903,7 @@ class LatentDiffusion(DDPM):
                                             clip_denoised=self.clip_denoised,
                                             quantize_denoised=quantize_denoised, return_x0=True,
                                             temperature=temperature[i], noise_dropout=noise_dropout,
-                                            score_corrector=score_corrector, corrector_kwargs=corrector_kwargs)
+                                            score_corrector=score_corrector, corrector_kwargs=corrector_kwargs, max_batch=max_batch)
             if mask is not None:
                 assert x0 is not None
                 img_orig = self.q_sample(x0, ts)
@@ -1195,7 +919,7 @@ class LatentDiffusion(DDPM):
     def p_sample_loop(self, cond, shape, return_intermediates=False,
                       x_T=None, verbose=False, callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, start_T=None,
-                      log_every_t=None):
+                      log_every_t=None, max_batch=None):
 
         if not log_every_t:
             log_every_t = self.log_every_t
@@ -1228,7 +952,7 @@ class LatentDiffusion(DDPM):
 
             img = self.p_sample(img, cond, ts,
                                 clip_denoised=self.clip_denoised,
-                                quantize_denoised=quantize_denoised)
+                                quantize_denoised=quantize_denoised, max_batch=max_batch)
             if mask is not None:
                 img_orig = self.q_sample(x0, ts)
                 img = img_orig * mask + (1. - mask) * img
@@ -1245,7 +969,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def sample(self, cond, batch_size=16, return_intermediates=False, x_T=None,
                verbose=True, timesteps=None, quantize_denoised=False,
-               mask=None, x0=None, shape=None,**kwargs):
+               mask=None, x0=None, shape=None, max_batch=None,**kwargs):
         if shape is None:
             shape = (batch_size, self.channels,) + tuple(self.infer_image_size)
         if cond is not None:
@@ -1258,11 +982,10 @@ class LatentDiffusion(DDPM):
                                   shape,
                                   return_intermediates=return_intermediates, x_T=x_T,
                                   verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
-                                  mask=mask, x0=x0)
+                                  mask=mask, x0=x0, max_batch=max_batch)
 
     @torch.no_grad()
     def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
-
         if ddim:
             ddim_sampler = DDIMSampler(self, **self.ddim_config)
             shape = (self.channels, ) + tuple(self.infer_image_size)
@@ -1283,7 +1006,7 @@ class LatentDiffusion(DDPM):
             return self.logging_decoder.decode(x)
 
     @torch.no_grad()
-    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
+    def log_images(self, batch, N=32, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
                    quantize_denoised=False, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
                    plot_diffusion_rows=False, verbose=False, plot_conditioned_samples=False, **kwargs):
 
@@ -1430,25 +1153,703 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, **kw):
         if self.conditioning_key is None:
-            out = self.diffusion_model(x, t)
-        elif self.conditioning_key == 'concat':
-            xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t)
-        elif self.conditioning_key == 'crossattn':
-            cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
-        elif self.conditioning_key == 'hybrid':
-            xc = torch.cat([x] + [c_concat], dim=1)
-            cc = torch.cat([c_crossattn], 1)
-            out = self.diffusion_model(xc, t, context=cc)
-        elif self.conditioning_key == 'adm':
-            cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc)
-        else:
-            raise NotImplementedError()
+            out = self.diffusion_model(x, t, **kw)
+        # elif self.conditioning_key == 'concat':
+        #     xc = torch.cat([x] + c_concat, dim=1)
+        #     out = self.diffusion_model(xc, t, **kw)
+        # elif self.conditioning_key == 'crossattn':
+        #     cc = torch.cat(c_crossattn, 1)
+        #     out = self.diffusion_model(x, t, context=cc, **kw)
+        # elif self.conditioning_key == 'hybrid':
+        if not isinstance(c_concat, list): c_concat = [c_concat]
+        if not isinstance(c_crossattn, list): c_crossattn = [c_crossattn]
+        xc = torch.cat([x] + c_concat, dim=1) if not c_concat[0] == None else x
+        cc = torch.cat(c_crossattn, 1) if c_crossattn[0] is not None else None
+        out = self.diffusion_model(xc, t, context=cc, **kw)
+        # elif self.conditioning_key == 'adm':
+        #     cc = c_crossattn[0]
+        #     out = self.diffusion_model(x, t, y=cc, **kw)
+        # else:
+        #     raise NotImplementedError()
 
         return out
     
     
+class ProjectionDiffusion(LatentDiffusion):
+    def __init__(self, use_curriculum_learning=False, shape=(64, 64, 32), label_key='o_indices', *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shape = list(shape)
+        self.label_key = label_key
+        self.hypers = hypers0612
+        self.use_curriculum_learning = use_curriculum_learning
+        assert IS_LEAP_AVAILABLE, f"please switch to an env with leap available"
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        sd = torch.load(path, map_location="cpu")
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+        org_sd = {}
+        for k in keys:
+            if k.startswith('model.diffusion_model'):
+                org_sd[k.replace('model.diffusion_model', 'model.diffusion_model.unet')] = sd[k]
+            elif k.startswith('cond_stage_model'):
+                org_sd[k.replace('cond_stage_model', 'cond_stage_model.crossattn_module')] = sd[k]
+        missing, unexpected = self.load_state_dict(org_sd, strict=False) \
+            if not only_model else self.model.load_state_dict(org_sd, strict=False)
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected Keys: {unexpected}")
+        
+    def on_fit_start(self, **kw):
+        # model_channels = self.model.diffusion_model.model_channels
+        # in_channel_enum = self.model.diffusion_model.in_channel_enum
+        # self.model.diffusion_model.static_projectors = [self._create_projector(level, num) for level, num in enumerate([model_channels] + in_channel_enum)]
+        # self.model.diffusion_model.middle_projector = self._create_projector(len(in_channel_enum) - 1, in_channel_enum[-1])
+        # # self.model.diffusion_model.middle_projector = self._create_projector(-1, in_channel_enum[-1], True)
+        # self.model.diffusion_model.out_projector = self._create_projector(0, 360, True)
+        # self.model.diffusion_model.coarse_projector = self._create_projector(0, 180, False, use_gpu=True)
+        # self.model.diffusion_model.fine_projector = self._create_projector(0, 180, True)
+        self.model.diffusion_model.projector = self._create_projector()
+            
+    # def _create_projector(self, level, ch, forward_proj=False, **kw):
+    #     proj_n_detector = [_ // 2 ** level for _ in self.hypers['n_detector']]
+    #     proj_n_volume = [_ // 2 ** level for _ in self.hypers['n_voxel']]
+    #     projector = Projector(forward_project=forward_proj, use_static=False, use_gpu=kw.get('use_gpu', True), batch_size=1, gpu_device=self.device)
+    #     projector.leapct.set_truncatedScan(True)
+    #     getattr(projector, self.hypers['mode'])(
+    #         numAngles=ch,
+    #         numRows=proj_n_detector[0],
+    #         numCols=proj_n_detector[1],
+    #         pixelHeight=self.hypers['s_detector'][0],
+    #         pixelWidth=self.hypers['s_detector'][1],
+    #         centerRow=proj_n_detector[0] // 2,
+    #         centerCol=proj_n_detector[1] // 2,
+    #         phis=(
+    #                 np.linspace(0, self.hypers.get('max_angle', 360), ch)
+    #             + self.hypers["start_angle"]
+    #         ).astype(np.float32),
+    #         # sod=hypers['distance_source_origin'],
+    #         # sdd=hypers['distance_source_detector'],
+    #     )
+    #     projector.set_volume(
+    #         numX=proj_n_volume[2],
+    #         numY=proj_n_volume[1],
+    #         numZ=proj_n_volume[0],
+    #         voxelWidth=self.hypers['s_voxel'][0],
+    #         voxelHeight=self.hypers['s_voxel'][1],
+    #         offsetX=self.hypers['offset_origin'][0],
+    #         offsetY=self.hypers['offset_origin'][1],
+    #         offsetZ=self.hypers['offset_origin'][2],
+    #     )
+    #     return projector
+    def _create_projector(self, phis=None, device=None):
+        from leaptorch import Projector
+        hypers = hypers0610
+        device = device or self.device
+        # ch = n_trgt + n_novel
+        ch = 360
+        phis = phis or (np.linspace(0, hypers.get('max_angle', 360), ch) + hypers["start_angle"]).astype(np.float32)
+        projector = Projector(forward_project=True, use_static=False, use_gpu=True, batch_size=1, gpu_device=device)
+        projector.leapct.set_truncatedScan(True)
+        getattr(projector, hypers['mode'])(
+            numAngles=ch,
+            numRows=hypers['n_detector'][0], 
+            numCols=hypers['n_detector'][1],
+            pixelHeight=hypers['s_detector'][0],
+            pixelWidth=hypers['s_detector'][1],
+            centerRow=hypers['n_detector'][0] // 2,
+            centerCol=hypers['n_detector'][1] // 2,
+            phis=phis
+            # sod=hypers['distance_source_origin'],
+            # sdd=hypers['distance_source_detector'],
+        )
+        projector.set_volume(
+            numX=hypers['n_voxel'][2],
+            numY=hypers['n_voxel'][1],
+            numZ=hypers['n_voxel'][0],
+            voxelWidth=hypers['s_voxel'][0],
+            voxelHeight=hypers['s_voxel'][1],
+            offsetX=hypers['offset_origin'][0],
+            offsetY=hypers['offset_origin'][1],
+            offsetZ=hypers['offset_origin'][2],
+        )
+        return projector
+    
+    def p_losses(self, o, cond, t, noise=None, batch=None):
+        o_start, o_novel = torch.split(o, [self.shape[0] + self.shape[1], self.shape[2]], dim=1)
+        
+        # apply curriculum learning
+        if self.use_curriculum_learning:
+            p = self.trainer.current_epoch / self.trainer.max_epochs
+            len_ctxt = torch.clip(round((1 - p) * (o_start.shape[1] - 1)), 1, o_start.shape[1] - 1)
+            len_trgt = o_start.shape[1] - len_ctxt
+            o_ctxt, o_trgt = torch.split(o_start, [len_ctxt, len_trgt], dim=1)
+        else:
+            o_ctxt, o_trgt = torch.split(o_start, [self.shape[0], self.shape[1]], dim=1)
+            
+        noise = default(noise, lambda: torch.randn_like(o_trgt))
+        ctxt_indices, trgt_indices, novel_indices = torch.split(batch[self.label_key][0], list(self.shape))
+            
+        o_trgt_noisy = self.q_sample(x_start=o_trgt, t=t, noise=noise, )
+        model_output = self.apply_model(o_trgt_noisy, t, cond,
+                                        ctxt_indices=ctxt_indices, trgt_indices=trgt_indices, novel_indices=novel_indices,
+                                        return_novels=True)[0]
+        o_hat_trgt, o_hat_novel = torch.split(model_output, [o_trgt.shape[1], o_novel.shape[1]], dim=1)
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        loss_simple_trgt = self.get_loss(o_hat_trgt, o_trgt, mean=False).mean([1, 2, 3])
+        loss_simple_final = self.get_loss(o_hat_novel, o_novel, mean=False).mean([1, 2, 3])
+        loss_simple = loss_simple_trgt + loss_simple_final
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        loss = loss_simple.mean()
+        loss_dict.update({f'{prefix}/loss': loss})
+
+        return loss, loss_dict
+    
+    def apply_model(self, x_noisy, t, cond, return_ids=False, **kw):
+        if isinstance(cond, dict):
+            # hybrid case, cond is exptected to be a dict
+            pass
+        else:
+            if not isinstance(cond, list):
+                cond = [cond]
+            key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
+            cond = {key: cond}
+
+        x_recon = self.model(x_noisy, t, **cond, **kw)
+        return x_recon
+    
+    def shared_step(self, batch, **kwargs):
+        x, c = self.get_input(batch, self.first_stage_key)
+        loss = self(x, c, batch=batch)
+        return loss
+    
+    def forward(self, x, c, *args, **kwargs):
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.to(self.dtype)))
+        return self.p_losses(x, c, t, *args, **kwargs)
+    
+    def log_images(self, batch, split, *args, **kwargs):
+        if split == 'train': return self.log_images_train(batch, *args, split=split, **kwargs)
+        else: return self.log_images_val(batch, *args, split=split, **kwargs)
+    
+    def log_images_train(self, batch, noise=None, *args, **kwargs):
+        o, c = self.get_input(batch, self.first_stage_key)
+        t = torch.randint(0, self.num_timesteps, (o.shape[0],), device=self.device).long()
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.to(self.dtype)))
+                
+        o_start, o_novel = torch.split(o, [self.shape[0] + self.shape[1], self.shape[2]], dim=1)
+        
+        # apply curriculum learning
+        if self.use_curriculum_learning:
+            p = self.trainer.current_epoch / self.trainer.max_epochs
+            len_ctxt = torch.clip(round((1 - p) * (o_start.shape[1] - 1)), 1, o_start.shape[1] - 1)
+            len_trgt = o_start.shape[1] - len_ctxt
+            o_ctxt, o_trgt = torch.split(o_start, [len_ctxt, len_trgt], dim=1)
+        else:
+            o_ctxt, o_trgt = torch.split(o_start, [self.shape[0], self.shape[1]], dim=1)
+            
+        noise = default(noise, lambda: torch.randn_like(o_trgt))
+        ctxt_indices, trgt_indices, novel_indices = torch.split(batch[self.label_key][0], list(self.shape))
+            
+        o_trgt_noisy = self.q_sample(x_start=o_trgt, t=t, noise=noise, )
+        model_output = self.apply_model(o_trgt_noisy, t, c,
+                                        ctxt_indices=ctxt_indices, trgt_indices=trgt_indices, novel_indices=novel_indices,
+                                        return_finals=True, return_s=True)
+        model_output, s = model_output
+        o_hat_trgt, o_hat_final = torch.split(model_output, [o_trgt.shape[1], o_novel.shape[1]], dim=1)
+        
+        logs = {
+            'o_ctxt': o_ctxt, 'o_trgt_noisy': o_trgt_noisy, 'o_trgt': o_trgt, 'o_final': o_novel,
+            'o_hat_trgt': o_hat_trgt, 'o_hat_final': o_hat_final, 's': s
+        }
+        return logs
+    
+    def log_images_val(self, batch, *args, **kwargs):
+        logs = super(ProjectionDiffusion, self).log_images(batch, *args, **kwargs)
+        z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
+                                           return_first_stage_outputs=True,
+                                           force_c_encode=True,
+                                           return_original_cond=True,
+                                           bs=kwargs.get('N', 8))
+        inputs = torch.split(logs['inputs'], self.shape, dim=1)
+        ctxt_indices, trgt_indices, final_indices = torch.split(batch[self.label_key][0], list(self.shape))
+        
+        logs['o_ctxt'] = inputs[0]
+        logs['o_trgt'] = inputs[1]
+        logs['o_hat_trgt'] = logs['samples']
+        s = self.apply_model(logs['samples'], torch.tensor([1.], device=z.device), cond=c, return_s=True,
+                             ctxt_indices=ctxt_indices, trgt_indices=trgt_indices, final_indices=final_indices,)[1]
+        logs['s'] = s
+        
+        del logs['inputs'], logs['samples']
+        
+        return logs
+        
+    @torch.no_grad()
+    def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+        if ddim:
+            ddim_sampler = DDIMSampler(self, **self.ddim_config)
+            shape = (self.channels, ) + tuple(self.infer_image_size)
+            samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size,
+                                                         shape, cond, verbose=False, **kwargs)
+
+        else:
+            samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
+                                                 return_intermediates=True,**kwargs)
+
+        return samples, intermediates
+       
+    
+class ProjectionDiffusion2D(LatentDiffusion):
+    def __init__(self, batch_size=32, normalizer_config=None, label_key='', *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label_key = label_key
+        self.batch_size = batch_size
+        self.normalizer = instantiate_from_config(normalizer_config)
+        
+    def get_input(self, 
+                  batch, 
+                  k, 
+                  return_first_stage_outputs=False, 
+                  force_c_encode=False, 
+                  cond_key=None, 
+                  return_original_cond=False, 
+                  bs=None,
+                  return_angles=False):
+        inputs = super().get_input(batch, k, return_first_stage_outputs, force_c_encode, cond_key, return_original_cond, bs)
+        
+        # chn = torch.sin(torch.linspace(0, 2*torch.pi, 360)) + 1
+        chn = torch.ones((360,))
+        chn = torch.multinomial(chn, num_samples=self.batch_size, replacement=False)
+        x, c = inputs
+        if x.ndim == 3: x = x[None]
+
+        inputs = [x[:, chn].view(-1, 1, *x.shape[2:]), c[:, chn].view(-1, 1, *c.shape[2:])]  # bs*batch_size, 1, H, W
+        if return_angles: 
+            angles = super(LatentDiffusion, self).get_input(batch, self.label_key)[:, chn]
+            return inputs + [angles[0]]
+        return inputs
+    
+    def shared_step(self, batch, **kwargs):
+        x, c, a = self.get_input(batch, self.first_stage_key, return_angles=True)
+        loss = self(x, c, angles=a)
+        return loss
+
+    def random_window_norm(self, args,):
+        pm, pM = int(self.normalizer.pm), int(self.normalizer.pM)
+        om, oM = int(self.normalizer.om), int(self.normalizer.oM)
+        wc = torch.randint(pm, pM, (1,)).item()
+        r = (self.normalizer.pM - self.normalizer.pm) // 2
+        wr = torch.randint(round(0.2 * r), int(r), (1,)).item()
+        for i in range(len(args)):
+            x = args[i]
+            x = (x - (wc - wr)) / (2 * wr)
+            x[x < 0] = 0
+            x[x > 1] = 1
+            args[i] = x
+        return args
+    
+    def p_losses(self, x_start, cond, t, noise=None, angles=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_start = self.normalizer.forward(x_start)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output, latent = self.apply_model(x_noisy, t, cond, return_latents=True)
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        logvar_t = self.logvar.to(self.device)[t]
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+        # contrastive loss
+        temperature = .1
+        batch_size = latent.shape[0]
+        pos_thresh = max(1, 120 * (1 - 5 * self.trainer.current_epoch / self.trainer.max_epochs))
+        feat = nn.functional.normalize(latent.reshape(batch_size, -1), dim=1)
+        sim_matrix = torch.matmul(feat, feat.T) / temperature - torch.eye(batch_size, device=feat.device) * 1e5
+        diff = (angles.unsqueeze(1) - angles.unsqueeze(0)).abs()
+        sim_gt = torch.minimum(diff, 360 - diff)
+        pos_mask = (sim_gt < pos_thresh) & (~torch.eye(batch_size, dtype=torch.bool, device=feat.device))
+
+        pos_exp = sim_matrix.exp() * pos_mask.float()
+        pos_sum = pos_exp.sum(dim=1)
+        all_sum = sim_matrix.exp().sum(dim=1)
+
+        loss_cont = (-torch.log((pos_sum + 1e-8) / (all_sum + 1e-8))).mean()
+        loss += loss_cont
+        loss_dict.update({f'{prefix}/loss_cont': loss_cont})
+        # consistency loss
+        # model_output_to_x0 = self.predict_start_from_noise(x_noisy, t, model_output)
+        # x0hat_denorm, x0_denorm = map(self.normalizer.backward, [model_output_to_x0, x_start])
+        # x0hat, x0 = self.random_window_norm([x0hat_denorm, x0_denorm])
+        # loss_cons = self.get_loss(x0hat, x0, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        # loss += loss_cons
+        # loss_dict.update({f'{prefix}/loss_cons': loss_cons.mean()})
+
+        return loss, loss_dict
+    
+
+class ConsistencyDiffusion(LatentDiffusion):
+    def __init__(self, cons_type='point_decode', *args, **kwargs):
+        self.cons_type = cons_type
+        self.freeze_load = False
+        super().__init__(*args, **kwargs)
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        sd = torch.load(path, map_location="cpu")
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+            sd, strict=False)
+        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing Keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected Keys: {unexpected}")
+
+        if self.freeze_load:
+            target_param_iter = self.named_parameters() if not only_model else self.model.named_parameters()
+            target_params = dict(target_param_iter)
+            sd_keys = set(sd.keys())
+            for name, param in target_params.items():
+                # Only consider parameter names that appear in the checkpoint and weren't missing.
+                if name in sd_keys and name not in missing + unexpected:
+                    param.requires_grad = False
+
+    def shared_step(self, batch, **kwargs):
+        x = super(LatentDiffusion, self).get_input(batch, self.first_stage_key)
+        c = super(LatentDiffusion, self).get_input(batch, self.cond_stage_key)
+        p = super(LatentDiffusion, self).get_input(batch, 'points_2d')
+        x = x.transpose(0, 1)
+        c = c.transpose(0, 1)
+        p = p[0]
+        loss, loss_dict = self(x, c, points_2d=p)
+        return loss, loss_dict
+
+    def forward(self, x, c, *args, **kwargs):
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        c = self.get_learned_conditioning(c)
+        return self.p_losses(x, c, t, *args, **kwargs)
+    
+    def apply_model(self, x_noisy, t, cond, **kw):
+        if isinstance(cond, dict):
+            # hybrid case, cond is exptected to be a dict
+            pass
+        else:
+            if not isinstance(cond, list):
+                cond = [cond]
+            key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
+            cond = {key: cond}
+        x_recon = self.model(x_noisy, t, **cond, **kw)
+        return x_recon
+
+    def p_losses(self, x_start, cond, t, **kw):
+        name = 'v1' if self.cons_type == 'point_decode' else 'v2'
+        fn = eval(f'self.p_losses_{name}')
+        return fn(x_start, cond, t, **kw)
+
+    def p_losses_v1(self, x_start, cond, t, noise=None, points_2d=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        b1 = torch.randint(1, x_noisy.shape[0], (1,))
+
+        model_output_dict = self.apply_model(torch.cat([x_noisy[:b1], x_start[b1:]], dim=0),
+                                            torch.cat([t[:b1], torch.zeros_like(t[b1:])], dim=0),
+                                            cond,
+                                            point_indices=points_2d,
+                                            model_3d=True,
+                                            detach_modeling=True,
+                                            b=b1)
+        image_out = model_output_dict['image_out']
+        point_out = model_output_dict['point_out']
+        point_out_gt = model_output_dict['point_out_gt']
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(image_out, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        logvar_t = self.logvar.to(self.device)[t]
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(image_out, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+        
+        # point consistentcy loss
+        loss_point = self.get_loss(point_out, point_out_gt, mean=False).mean(1)
+        loss += loss_point.max() * 10
+        loss_dict.update({f'{prefix}/loss_point': loss_point.mean()})
+        
+        return loss, loss_dict
+    
+    def p_losses_v2(self, x_start, cond, t, noise=None, **kw):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond)
+        # model_output2 = self.apply_model(x_noisy[:b], t[:b], cond[:b], context_target=cond[b:b*2])
+        # model_output = torch.cat([model_output1, model_output2], dim=0)
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        logvar_t = self.logvar.to(self.device)[t]
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean([1, 2, 3] + [4,] if self.dims == 3 else [])
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+
+        return loss, loss_dict
+
+    @torch.no_grad()
+    def log_images(self, batch, N=32, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
+                   quantize_denoised=False, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
+                   plot_diffusion_rows=False, verbose=False, plot_conditioned_samples=False, **kwargs):
+
+        use_ddim = ddim_steps is not None
+
+        log = dict()
+        x = super(LatentDiffusion, self).get_input(batch, self.first_stage_key)
+        c = super(LatentDiffusion, self).get_input(batch, self.cond_stage_key)
+        x = x.transpose(0, 1)
+        c = c.transpose(0, 1)
+        z = xrec = x
+        xc = None
+        c = self.get_learned_conditioning(c)
+        
+        cf = super().get_input(batch, self.first_stage_model.cond_key).to(self.device) if self.is_conditional_first_stage else None
+        N = min(x.shape[0], N)
+        n_row = min(x.shape[0], n_row)
+        log["inputs"] = self._decode_logging(x)
+        log["reconstruction"] = self._decode_logging(xrec)
+        # log['text'] = batch.get("prompt", "")
+        if self.model.conditioning_key is not None:
+            if hasattr(self.cond_stage_model, "decode"):
+                xc = self.cond_stage_model.decode(c)
+                log["conditioning"] = xc
+            elif self.cond_stage_key in ["caption"]:
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["caption"])
+                log["conditioning"] = xc
+            elif self.cond_stage_key == 'class_label':
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["human_label"])
+                log['conditioning'] = xc
+            elif isimage(xc):
+                log["conditioning"] = xc
+
+        if plot_diffusion_rows:
+            # get diffusion row
+            diffusion_row = list()
+            z_start = z[:n_row]
+            for t in range(self.num_timesteps):
+                if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+                    t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+                    t = t.to(self.device).long()
+                    noise = torch.randn_like(z_start)
+                    z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
+                    diffusion_row.append(self.decode_first_stage(z_noisy, cf))
+
+            diffusion_row = torch.stack(diffusion_row)  # n_log_step, n_row, C, H, W
+            diffusion_grid = rearrange(diffusion_row, 'n b c ... -> b n c ...')
+            if self.dims == 3:
+                diffusion_grid = rearrange(diffusion_grid, 'b n c h w d -> (b n h) c w d')
+            elif self.dims == 2: diffusion_grid = rearrange(diffusion_grid, 'b n c h w -> (b n) c h w')
+            diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
+            log["diffusion_row"] = diffusion_grid
+
+        if sample:
+            # get denoise row
+            with self.ema_scope():
+                samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                         ddim_steps=ddim_steps, eta=ddim_eta, batch=batch)
+                # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
+            x_samples = self.decode_first_stage(samples, cf)
+            log["samples"] = self._decode_logging(x_samples)
+            if self.cons_type == 'point_decode':
+                geometry = self.trainer.datamodule.datasets['train'].geometry
+                points_3d = np.mgrid[:geometry['n_voxel'][0], :geometry['n_voxel'][1], :geometry['n_voxel'][2]].reshape(3, -1).T
+                points_3d = points_3d.astype(np.float32) / (np.array([geometry['n_voxel']]) - 1)
+                _, points_2d = self.trainer.datamodule.datasets['train'].get_points(points_3d, batch['selected_angle_in_radians'][0, :samples.shape[0]].cpu().numpy())
+                points_2d = torch.tensor(points_2d, device=self.device, dtype=torch.float32)
+                eval_npoint = 100000
+                total_npoint = points_2d.shape[1]
+                n_batch = int(np.ceil(total_npoint / eval_npoint))
+                points_2d_hat = []
+                for i in range(n_batch):
+                    left = i * eval_npoint
+                    right = min((i + 1) * eval_npoint, total_npoint)
+                    model_output = self.apply_model(samples, torch.zeros(samples.shape[0], device=self.device),
+                                                    cond=c[:samples.shape[0]], 
+                                                    point_indices=points_2d[..., left:right, :],
+                                                    model_3d=True,
+                                                    detach_modeling=True,
+                                                    b=1)
+                    points_2d_hat.append(model_output['point_out_gt'])
+                points_3d_hat = torch.cat(points_2d_hat, dim=2).view(-1, *geometry['n_voxel'])
+                log['backward'] = points_3d_hat
+            if plot_denoise_rows:
+                denoise_grid = self._get_denoise_row_from_list(z_denoise_row, cf)
+                log["denoise_row"] = denoise_grid
+            
+            if plot_conditioned_samples and self.model.conditioning_key == "concat":
+                log["conditioned_samples"] = torch.cat([log["samples"], log["conditioning"]], dim=1)
+
+            if quantize_denoised and not isinstance(self.first_stage_model, AutoencoderKL) and not isinstance(
+                    self.first_stage_model, IdentityFirstStage):
+                # also display when quantizing x0 while sampling
+                with self.ema_scope("Plotting Quantized Denoised"):
+                    samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                             ddim_steps=ddim_steps, eta=ddim_eta,
+                                                             quantize_denoised=True, batch=batch)
+                    # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
+                    #                                      quantize_denoised=True)
+                x_samples = self.decode_first_stage(samples.to(self.device), cf)
+                log["samples_x0_quantized"] = x_samples
+
+            if inpaint:
+                # make a simple center square
+                b, h, w = z.shape[0], z.shape[2], z.shape[3]
+                mask = torch.ones(N, h, w).to(self.device)
+                # zeros will be filled in
+                mask[:, h // 4:3 * h // 4, w // 4:3 * w // 4] = 0.
+                mask = mask[:, None, ...]
+                with self.ema_scope("Plotting Inpaint"):
+
+                    samples, _ = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, batch=batch)
+                x_samples = self.decode_first_stage(samples.to(self.device), cf)
+                log["samples_inpainting"] = x_samples
+                log["mask"] = mask
+
+                # outpaint
+                with self.ema_scope("Plotting Outpaint"):
+                    samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, batch=batch)
+                x_samples = self.decode_first_stage(samples.to(self.device), cf)
+                log["samples_outpainting"] = x_samples
+
+        if plot_progressive_rows:
+            with self.ema_scope("Plotting Progressives"):
+                img, progressives = self.progressive_denoising(c,
+                                                               shape=(self.channels,) + tuple(self.infer_image_size),
+                                                               batch_size=N)
+            prog_row = self._get_denoise_row_from_list(progressives, cf, desc="Progressive Generation")
+            log["progressive_row"] = prog_row
+
+        if return_keys:
+            if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:
+                return log
+            else:
+                return {key: log[key] for key in return_keys}
+        return log
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        params = list(p for p in self.model.parameters() if p.requires_grad)
+        if self.cond_stage_trainable:
+            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
+            params = params + list(p for p in self.cond_stage_model.parameters() if p.requires_grad)
+        if self.learn_logvar:
+            print('Diffusion model optimizing logvar')
+            params.append(self.logvar)
+        opt = torch.optim.AdamW(params, lr=lr)
+        if self.use_scheduler:
+            assert 'target' in self.scheduler_config
+            scheduler = instantiate_from_config(self.scheduler_config)
+
+            print("Setting up LambdaLR scheduler...")
+            scheduler = [
+                {
+                    'scheduler': LambdaLR(opt, lr_lambda=scheduler.schedule),
+                    'interval': 'step',
+                    'frequency': 1
+                }]
+            return [opt], scheduler
+        return opt

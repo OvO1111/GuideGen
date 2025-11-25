@@ -1,0 +1,104 @@
+model:
+  base_learning_rate: 1e-5
+  train_target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    monitor: val/reconstruction_loss
+    image_key: image
+    embed_dim: 4
+    use_window_norm_in_forward: false
+    dims: 3
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 10001
+        disc_weight: 0.5
+        gan_feat_weight: 1.
+        n_frames_to_select: 3  # 1 as in medicaldiffusion
+
+    ddconfig:
+      double_z: false
+      z_channels: 4
+      resolution: [256, 256, 256]
+      in_channels: 1
+      out_ch: 1
+      ch: 8
+      ch_mult: [ 1, 2, 4 ]  
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+      attn_type: none
+
+  test_only_params:
+    ckpt_path: /home/dlr/data/ldm/aekl_256_256_256/checkpoints/last.ckpt
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 16
+    wrap: False
+    train:
+      target: ldm.data.base.MSDDataset
+      params:
+        split: train
+        # max_size: 2
+        output_size: [256, 256, 256]
+        base_dir: 
+          # - /home/dlr/data/datasets/msd_colon
+          # - /home/dlr/data/datasets/msd_pancreas
+          # - /home/dlr/data/datasets/msd_liver
+          # - /home/dlr/data/datasets/msd_lung
+          # - /home/dlr/data/datasets/word
+          # - /home/dlr/data/datasets/amos22
+          # - /home/dlr/data/datasets/btcv_abd
+          - /home/dlr/data/datasets/CT-RATE
+    validation:
+      target: ldm.data.base.MSDDataset
+      params:
+        split: val
+        # max_size: 50
+        output_size: [256, 256]
+        base_dir: 
+          # - /home/dlr/data/datasets/msd_colon
+          # - /home/dlr/data/datasets/msd_pancreas
+          # - /home/dlr/data/datasets/msd_liver
+          # - /home/dlr/data/datasets/msd_lung
+          # - /home/dlr/data/datasets/word
+          # - /home/dlr/data/datasets/amos22
+          # - /home/dlr/data/datasets/btcv_abd
+          - /home/dlr/data/datasets/CT-RATE
+    test:
+      target: ldm.data.base.MSDDataset
+      params:
+        split: test
+        output_size: [256, 256]
+        base_dir: 
+          # - /home/dlr/data/datasets/msd_colon
+          # - /home/dlr/data/datasets/msd_pancreas
+          # - /home/dlr/data/datasets/msd_liver
+          # - /home/dlr/data/datasets/msd_lung
+          # - /home/dlr/data/datasets/word
+          # - /home/dlr/data/datasets/amos22
+          # - /home/dlr/data/datasets/btcv_abd
+          - /home/dlr/data/datasets/CT-RATE
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        train_batch_frequency: 200
+        max_images: 10
+        log_images_kwargs: 
+          ddim_steps: 50
+        logger:
+          inputs: 
+            target: image_rescale
+          reconstructions:
+            target: image_rescale
+
+  trainer:
+    benchmark: true
+    accumulate_grad_batches: 1
+    limit_test_batches: 100
+

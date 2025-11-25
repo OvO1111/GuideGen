@@ -3,7 +3,7 @@ import torch.nn as nn
 from functools import partial, reduce
 from einops import rearrange, repeat
 import re, omegaconf
-import numpy as np
+import numpy as np, math
 # import clip
 # import kornia
 
@@ -39,15 +39,15 @@ class ClassEmbedder(nn.Module):
 
 class TransformerEmbedder(AbstractEncoder):
     """Some transformer encoder layers"""
-    def __init__(self, n_embed, n_layer, vocab_size, max_seq_len=77, device="cuda"):
+    def __init__(self, n_embed, n_layer, vocab_size, max_seq_len=77, device="cuda", **kw):
         super().__init__()
         self.device = device
         self.transformer = TransformerWrapper(num_tokens=vocab_size, max_seq_len=max_seq_len,
-                                              attn_layers=Encoder(dim=n_embed, depth=n_layer))
+                                              attn_layers=Encoder(dim=n_embed, depth=n_layer), **kw)
 
     def forward(self, tokens):
-        tokens = tokens.to(self.device)  # meh
-        z = self.transformer(tokens, return_embeddings=True)
+        # tokens = tokens.to(self.device).long()  # meh
+        z = self.transformer(tokens.long(), return_embeddings=True)
         return z
 
     def encode(self, x):
@@ -218,6 +218,17 @@ class IdentityFirstStage(nn.Module):
         return self.dummy(p)
     
     
+class IdentityEmbedder(AbstractEncoder):
+    def __init__(self,):
+        super().__init__()
+
+    def forward(self, *a, **kw):
+        return self.encode(*a, **kw)
+    
+    def encode(self, tensor: torch.Tensor):
+        return tensor
+    
+    
 class FrozenBERTEmbedder(AbstractEncoder):
     use_text_split = False
     bert_max_length = 512
@@ -355,3 +366,63 @@ class HybridConditionEncoder(nn.Module):
         return x
     
     
+class AngleEmbedder(nn.Module):
+    def __init__(self,
+                 embed_angles=None,
+                 n_embed=None,
+                 d_embed=64,):
+        super().__init__()
+        assert embed_angles or n_embed, "must specify either embed_angles or n_embed"
+        if embed_angles is not None:
+            n_embed = len(embed_angles)
+        elif n_embed is not None:
+            embed_angles = torch.linspace(0, 360, n_embed)
+        
+        self.n_embed = n_embed
+        self.register_buffer('embed_angles', torch.tensor(omegaconf.OmegaConf.to_container(embed_angles)))
+        self.embedding = nn.Embedding(num_embeddings=n_embed,
+                                      embedding_dim=d_embed)
+        
+    def forward(self, tokens):
+        embed = self.embedding(torch.arange(self.n_embed, device=tokens.device, dtype=torch.long))
+        floor = (tokens[..., None] - self.embed_angles.view(1, 1, -1))
+        floor = (floor + (floor < 0) * 360).abs().argmin(-1)
+        ceil = (floor + 1) * (floor + 1 < self.n_embed)
+        w = (tokens - self.embed_angles[floor]) / \
+            ((self.embed_angles[ceil] - self.embed_angles[floor]) * (ceil > floor) + (360 - self.embed_angles[floor] + self.embed_angles[ceil]) * (ceil < floor))
+        w = w[..., None]
+        interp = embed[floor] * (1-w) + embed[ceil] * w
+        return interp
+    
+    def encode(self, tokens):
+        return self(tokens)
+        
+        
+class CosineAngleEmbedder(nn.Module):
+    def __init__(self, d_embed=64):
+        super().__init__()
+        self.d_embed = d_embed
+
+    def angle_embedding(self, angles, max_period=10000, repeat_only=False):
+        angles = angles * (torch.pi / 180)
+        if not repeat_only:
+            half = self.d_embed // 2
+            # freqs = torch.exp(
+            #     -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+            # ).to(device=angles.device)
+            freqs = torch.arange(start=0, end=half, dtype=torch.float32)
+            print(freqs)
+            args = angles[:, None].float() * freqs[None]
+            embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+            if self.d_embed % 2:
+                embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        else:
+            embedding = repeat(angles, 'b -> b d', d=self.d_embed)
+        return embedding
+        
+    def forward(self, angles_in_degrees):
+        emb = self.angle_embedding(angles_in_degrees, repeat_only=False)
+        return emb
+    
+    def encode(self, tokens):
+        return self(tokens)

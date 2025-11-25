@@ -43,12 +43,14 @@ def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2,
     return betas.numpy()
 
 
-def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps, verbose=True):
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps, verbose=True, ddim_timesteps_preset=None):
     if ddim_discr_method == 'uniform':
         c = num_ddpm_timesteps // num_ddim_timesteps
         ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
     elif ddim_discr_method == 'quad':
         ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'fixed':
+        ddim_timesteps = ddim_timesteps_preset
     else:
         raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
 
@@ -208,13 +210,13 @@ def mean_flat(tensor):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
-def normalization(channels):
+def normalization(channels, groups=32):
     """
     Make a standard normalization layer.
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    return GroupNormX(groups, channels)
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
@@ -224,6 +226,10 @@ class SiLU(nn.Module):
 
 
 class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x).type(x.dtype)
+
+class GroupNormX(nn.GroupNorm):
     def forward(self, x):
         return super().forward(x).type(x.dtype)
 
