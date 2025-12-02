@@ -338,46 +338,46 @@ def medsyn_transform(x: torch.Tensor):
             
             
 def main():
-    # with open("/ailab/user/dailinrui/data/datasets/kits23/val.list") as f:
+    # with open("/ailab/user/xxx/data/datasets/kits23/val.list") as f:
     #     cases = [line.strip().replace('.h5', '.nii.gz') for line in f.readlines()]
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/datasets/kits23/labels",
-    #                                                "/ailab/user/dailinrui/data/datasets/kits23/preds",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/datasets/kits23/labels",
+    #                                                "/ailab/user/xxx/data/datasets/kits23/preds",
     #                                                num_classes=3, case_to_focus=cases)
-    # with open("/ailab/user/dailinrui/data/datasets/msd_liver/val.list") as f:
+    # with open("/ailab/user/xxx/data/datasets/msd_liver/val.list") as f:
     #     cases = [line.strip() for line in f.readlines()]
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/datasets/msd_liver/labelsTr",
-    #                                                "/ailab/user/dailinrui/data/datasets/msd_liver/predsVal",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/datasets/msd_liver/labelsTr",
+    #                                                "/ailab/user/xxx/data/datasets/msd_liver/predsVal",
     #                                                num_classes=3, case_to_focus=cases, classes_to_focus=[2], metrics=['hd95', 'dice'])
     
     fn = lambda x: resize(organ_transform(x), size=(128, 128, 128))
-    metric_calculator = ComputeGenerationMetrics("/home/dlr/data/datasets/amos22/labelsTr",
-                                                 "/home/dlr/data/datasets/amos22/labelsTr",
+    metric_calculator = ComputeGenerationMetrics("/home/xxx/data/datasets/amos22/labelsTr",
+                                                 "/home/xxx/data/datasets/amos22/labelsTr",
                                                  metrics=['lpips', 'fid'], source_transform=fn, target_transform=fn)
-    # metric_calculator = ComputeGenerationMetrics("/ailab/user/dailinrui/data/ldm/ensemble_anatomical_ddpm_128_128_128/dataset/samples",
-    #                                              "/ailab/user/dailinrui/data/datasets/ensemble/totalseg",
+    # metric_calculator = ComputeGenerationMetrics("/ailab/user/xxx/data/ldm/ensemble_anatomical_ddpm_128_128_128/dataset/samples",
+    #                                              "/ailab/user/xxx/data/datasets/ensemble/totalseg",
     #                                              metrics=['lpips', 'fid'], source_transform=ddpm_transform, target_transform=organ_transform)
-    # metric_calculator = ComputeGenerationMetrics("/ailab/user/dailinrui/data/datasets/compr_syntumor",
-    #                                              "/ailab/user/dailinrui/data/datasets/ensemble/tumorseg",
+    # metric_calculator = ComputeGenerationMetrics("/ailab/user/xxx/data/datasets/compr_syntumor",
+    #                                              "/ailab/user/xxx/data/datasets/ensemble/tumorseg",
     #                                              metrics=['lpips', 'fid'], source_transform=noise_transform, target_transform=tumor_transform,)
-                                                 #target_case=[_ for _ in os.listdir("/ailab/user/dailinrui/data/datasets/ensemble/tumorseg") if 'LI' in _ or 'liver' in _ ])
-    # metric_calculator = ComputeGenerationMetrics("/ailab/user/dailinrui/data/ldm/guidegen_ldm_128_128_128_wo_cam/dataset_noddim/inputs_value",
-    #                                              "/ailab/user/dailinrui/data/ldm/guidegen_ldm_128_128_128_wo_cam/dataset_noddim/samples_value",
+                                                 #target_case=[_ for _ in os.listdir("/ailab/user/xxx/data/datasets/ensemble/tumorseg") if 'LI' in _ or 'liver' in _ ])
+    # metric_calculator = ComputeGenerationMetrics("/ailab/user/xxx/data/ldm/guidegen_ldm_128_128_128_wo_cam/dataset_noddim/inputs_value",
+    #                                              "/ailab/user/xxx/data/ldm/guidegen_ldm_128_128_128_wo_cam/dataset_noddim/samples_value",
     #                                              metrics=['lpips', 'fid', 'fvd'], max_size=100, source_transform=normalize, target_transform=normalize)
-    # metric_calculator = ComputeGenerationMetrics("/ailab/user/dailinrui/data/ldm/monai_kl_ldm_text_128_128_128/dataset/inputs_value",
-    #                                              "/ailab/user/dailinrui/data/ldm/monai_kl_ldm_text_128_128_128/dataset/samples_value",
+    # metric_calculator = ComputeGenerationMetrics("/ailab/user/xxx/data/ldm/monai_kl_ldm_text_128_128_128/dataset/inputs_value",
+    #                                              "/ailab/user/xxx/data/ldm/monai_kl_ldm_text_128_128_128/dataset/samples_value",
     #                                              metrics=['lpips', 'fid'], max_size=100, source_transform=normalize, target_transform=normalize)
     
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset201_BTCV_ABD/predsTs",
-    #                                                "/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset201_BTCV_ABD/labelsTs",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset201_BTCV_ABD/predsTs",
+    #                                                "/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset201_BTCV_ABD/labelsTs",
     #                                                num_classes=20, classes_to_focus=[], metrics=['dice', 'precision', 'recall'],)
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset203_AMOS/predsTs",
-    #                                                "/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset203_AMOS/labelsTs",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset203_AMOS/predsTs",
+    #                                                "/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset203_AMOS/labelsTs",
     #                                                num_classes=20, classes_to_focus=[], metrics=['dice', 'precision', 'recall'],)
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset204_MSD_COLON/predsTsV1",
-    #                                                "/ailab/user/dailinrui/data/nnUNetv2/nnUNet_raw/Dataset204_MSD_COLON/labelsTs",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset204_MSD_COLON/predsTsV1",
+    #                                                "/ailab/user/xxx/data/nnUNetv2/nnUNet_raw/Dataset204_MSD_COLON/labelsTs",
     #                                                num_classes=2, classes_to_focus=[1], metrics=['dice', 'precision', 'recall', 'hd95'],)
-    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/dailinrui/data/ldm/monai_kl_ldm_128_128_128/dataset/consistency/totalseg",
-    #                                                "/ailab/user/dailinrui/data/ldm/monai_kl_ldm_128_128_128/dataset/consistency/cond_totalseg",
+    # metric_calculator = ComputeSegmentationMetrics("/ailab/user/xxx/data/ldm/monai_kl_ldm_128_128_128/dataset/consistency/totalseg",
+    #                                                "/ailab/user/xxx/data/ldm/monai_kl_ldm_128_128_128/dataset/consistency/cond_totalseg",
     #                                                num_classes=20, classes_to_focus=[], metrics=['dice'], source_transform=totalsegv2_transform)
     metric_calculator.compute()
     

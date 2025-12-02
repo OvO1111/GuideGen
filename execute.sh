@@ -1,6 +1,34 @@
-#!/bin/sh
-# export exp=cmu_swinunetr ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=swinunetr"
-# export exp=cmu_unetpp ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=unetpp"
-# export exp=cmu_vnet ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "torchrun --nproc-per-node=1 main.py --base ./configs/downstream/segmentation.yaml -t --name $exp --gpus 0, model.params.backbone_name=vnet"
-# export exp=run_exp ; sbatch -D $(pwd) -J $exp -o outs/out_$exp.txt -p smart_health_02 -N 1 -n 1 --cpus-per-task=8 --gpus=1 --mem=128G --wrap "/ailab/user/dailinrui/.conda/envs/ldm/bin/python /ailab/user/dailinrui-hdd/code/latentdiffusion/ldm/data/guidegen.py"
-export CUDA_VISIBLE_DEVICES=0,1,2,3 ; torchrun --nproc-per-node=4 main.py -b ./configs/autoencoder/ae.yaml --name aekl_128_512_512 -t --debug
+# train script
+# stage 1: training categorical diffusion model
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=20000 main.py\
+     -t \
+     --debug \                                                                          # --debug flag tells the script to use tensorboard instead of wandb logger
+     --gpus 0,1,2,3 \
+     --base configs/diffusion/cdpm.yaml \
+     --name cdpm \
+     --resume_from_checkpoint /home/xxx/data/ldm/cdpm/checkpoints/last.ckpt \           # delete this line if you are not resuming from a checkpoint
+     data.params.train.params.max_size=1000                                             # modifying config parameters in cli is also possible via omegaconf.merge(cfg, cli)
+
+
+# stage 2: training autoencoder
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=20001 main.py\   # note that stage 1 and stage 2 can be trained in parallel
+     -t \
+     --debug \
+     --gpus 0,1,2,3 \
+     --base configs/autoencoder/ae.yaml \
+     --name ae \
+
+# use the trained autoencoder to save encoded latents for your dataset to save VRAM for stage 3
+# if you have enough VRAM (80G VRAM is required for directly training on 256**3 volumes), you do not need to do this)
+python inference/save_latents.py \
+    --config configs/autoencoder/ae.yaml \
+    --checkpoint /home/xxx/data/ldm/ae/checkpoints/last.ckpt \
+    --save_root /home/xxx/data/your_dataset/latents
+
+# stage 3: training latent diffusion model
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=20002 main.py\
+     -t \
+     --debug \
+     --gpus 0,1,2,3 \
+     --base configs/diffusion/ldm.yaml \
+     --name ldm \

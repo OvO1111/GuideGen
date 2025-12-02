@@ -233,7 +233,7 @@ class FrozenBERTEmbedder(AbstractEncoder):
     use_text_split = False
     bert_max_length = 512
     def __init__(self, ckpt_path="/ailab/user/dailinrui-hdd/data/dependency/bert-ernie-health",
-                 device="cuda", freeze=True, max_length=512):
+                 device="cuda", freeze=True, max_length=512, d_embed=768):
         super().__init__()
         self.device = device
         self.max_length = max_length
@@ -244,6 +244,10 @@ class FrozenBERTEmbedder(AbstractEncoder):
         self.transformer = AutoModel.from_pretrained(ckpt_path, local_files_only=True).to(self.device)
         if freeze:
             self.freeze()
+        if d_embed != 768:
+            self.project = nn.Linear(768, d_embed)
+        else:
+            self.project = nn.Identity()
 
     def freeze(self):
         self.transformer = self.transformer.eval()
@@ -305,7 +309,7 @@ class FrozenBERTEmbedder(AbstractEncoder):
 
         z = outputs.last_hidden_state
         z = rearrange(z, "(b x) n l -> b (n x) l", b=b, x=self.bert_encode_batch, n=self.bert_max_length)
-        return z
+        return self.project(z)
 
     def encode(self, text):
         return self(text)
@@ -364,65 +368,29 @@ class HybridConditionEncoder(nn.Module):
     
     def decode(self, x):
         return x
-    
-    
-class AngleEmbedder(nn.Module):
-    def __init__(self,
-                 embed_angles=None,
-                 n_embed=None,
-                 d_embed=64,):
-        super().__init__()
-        assert embed_angles or n_embed, "must specify either embed_angles or n_embed"
-        if embed_angles is not None:
-            n_embed = len(embed_angles)
-        elif n_embed is not None:
-            embed_angles = torch.linspace(0, 360, n_embed)
-        
-        self.n_embed = n_embed
-        self.register_buffer('embed_angles', torch.tensor(omegaconf.OmegaConf.to_container(embed_angles)))
-        self.embedding = nn.Embedding(num_embeddings=n_embed,
-                                      embedding_dim=d_embed)
-        
-    def forward(self, tokens):
-        embed = self.embedding(torch.arange(self.n_embed, device=tokens.device, dtype=torch.long))
-        floor = (tokens[..., None] - self.embed_angles.view(1, 1, -1))
-        floor = (floor + (floor < 0) * 360).abs().argmin(-1)
-        ceil = (floor + 1) * (floor + 1 < self.n_embed)
-        w = (tokens - self.embed_angles[floor]) / \
-            ((self.embed_angles[ceil] - self.embed_angles[floor]) * (ceil > floor) + (360 - self.embed_angles[floor] + self.embed_angles[ceil]) * (ceil < floor))
-        w = w[..., None]
-        interp = embed[floor] * (1-w) + embed[ceil] * w
-        return interp
-    
-    def encode(self, tokens):
-        return self(tokens)
-        
-        
-class CosineAngleEmbedder(nn.Module):
-    def __init__(self, d_embed=64):
-        super().__init__()
-        self.d_embed = d_embed
 
-    def angle_embedding(self, angles, max_period=10000, repeat_only=False):
-        angles = angles * (torch.pi / 180)
-        if not repeat_only:
-            half = self.d_embed // 2
-            # freqs = torch.exp(
-            #     -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-            # ).to(device=angles.device)
-            freqs = torch.arange(start=0, end=half, dtype=torch.float32)
-            print(freqs)
-            args = angles[:, None].float() * freqs[None]
-            embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-            if self.d_embed % 2:
-                embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        else:
-            embedding = repeat(angles, 'b -> b d', d=self.d_embed)
-        return embedding
+
+class KnowledgeInjection(nn.Module):
+    def __init__(self, k_embed=16, d_embed=64, n_query=16, n_layers=3, freeze_bert=False):
+        super().__init__()
+        self.k = k_embed
+        self.n = n_layers
+        self.text_embedder = FrozenBERTEmbedder(freeze=freeze_bert, d_embed=d_embed)
+        self.ql = torch.nn.Parameter(torch.zeros((n_query, d_embed, n_layers)), requires_grad=True)
+        self.ol = torch.nn.Parameter(torch.zeros((d_embed, k_embed, n_layers)), requires_grad=True)
+
+    def text_embedding(self, text):
+        return self.text_embedder(text)
         
-    def forward(self, angles_in_degrees):
-        emb = self.angle_embedding(angles_in_degrees, repeat_only=False)
-        return emb
+    def forward(self, text, i_layer=0):
+        emb = self.text_embedding(text)
+        ql = self.ql[:, :, i_layer]
+        ol = self.ol[:, :, i_layer]
+
+        zi = (torch.einsum('bid,bjd->bij', ql, emb) / emb.size(-1)**(0.5)).softmax(-1)
+        zi = torch.nn.functional.layer_norm(torch.einsum('bij,bjm->bim', zi, emb))
+        zi = torch.nn.functional.dropout1d(torch.einsum('bim,md->bid', zi, ol), p=0.1)
+        return zi
     
     def encode(self, tokens):
-        return self(tokens)
+        return [self(tokens, i_layer=i) for i in range(self.n)]

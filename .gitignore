@@ -50,6 +50,8 @@ Thumbs.db
 dependency/
 wandb/
 baselines/
+helpers/
+r2_gaussian/
 
 *.npy
 *.npz

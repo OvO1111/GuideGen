@@ -1,61 +1,48 @@
-3D version of "High-Resolution Image Synthesis with Latent Diffusion Models" or "Stable Diffusion"
+# Official Implementation of GuideGen: A Text-Guided Framework for Full-torso Anatomy and CT Volume Generation (AAAI-26)
+
+[[Arxiv paper](https://arxiv.org/abs/2403.07247)]
+
+Steps to run the experiments:
 - prepare env:
 `conda env create -f environment.yml`
-- train command:
-`torchrun --nproc-per-node=<ngpus> main.py --base <config file path> -t --name <experiment name>`
-- test command:
-`python main.py --base <config file path> --name <experiment name>`, which should be just the train command minus `-t` flag
+- train models (follow the instructions in `execute.sh`)
+- test models (using the same cli instruction as in training minus the `-t` flag)
 
- before train/inference process, compile a config file, which consists of three major parts: `model`, `data` and other lightning-related modules.
+Before train/inference process, you also need to compile a config file, which consists of three major keys: `model`, `data` and other lightning-related modules inside `trainer`. You can find samples of them under `configs/` folder.
 
- Firstly, in `model`, there is
-```
-base_learning_rate: 1.5e-4    
-```
-specifying the BASE learning rate for training model, which may be changed by pytorch-lightning  following specific batch size and GPU number of choice
-```
-train_target: TARGET_TRAIN
-test_target:  TARGET_TEST
-params:       **PARAM_DICT
-```
-where each target name should be the module import path relative to the root directory (`./`), *e.g.* a train target of `ldm.models.ldm.ddpm.DDPM` will instantiate `DDPM` module in `./ldm/models/ldm/ddpm.py` for training. Pass the parameters in the params part in a key: value format
-```
-test_only_params: **PARAM_DICT
-```
-this param dict is used to assign extra parameters in the TARGET_TEST module (which should inherit the TRAIN_TARGET), mostly the checkpoint path to trained model and others related to saving the generated images
+For reference, the dataset organization in my case is:<br>
+`<dataset name>/`<br>
+---- `train/`<br>
+---- ---- `Case0001.nii.gz`<br>
+---- `val/`<br>
+---- ---- `Case0002.nii.gz`<br>
+---- `test/`<br>
+---- `totalseg/`<br>
+---- ---- `Case0001.nii.gz`<br>
+---- ---- `Case0002.nii.gz`<br>
+---- `tumorseg/`<br>
+You probably need to write your own `Dataset` class and config files according to your conventions.
 
-Secondly, in `data`, there generally is not much to change and the parameters should be self-explanatory
-```
-target: main.DataModuleFromConfig
-params:
-  batch_size: $bs
-  num_workers: $nw
-  train: 
-    target: ldm.data.base.SimpleDataset
-    params: **PARAM_DICT
-  validation:
-    ...
-  test:
-    ...
-```
-which uses the module `SimpleDataset` in `./ldm/data/base.py`, a wrapper class of `CacheDataset` from `monai`
+# Datasets
+- [BTCV Multi-organ Segmentation](https://www.synapse.org/Synapse:syn3193805/challenge/)
+- [AMOS Multi-organ Segmentation](https://amos22.grand-challenge.org/)
+- [MSD Tumor Segmentation](http://medicaldecathlon.com/)
+- [KiTS Tumor Segmentation](https://kits-challenge.org/kits23/)
+- [TCIA Archive](https://www.cancerimagingarchive.net/browse-collections/)
 
-Finally, you can pass whatever arguments supported by pytorch-lightning trainer either as command flags or in the `trainer` section of the config file
-```
-accumulate_grad_batches: 1
-```
-specifies that pl should accumulate model gradient per batch
-```
-max_epochs: 500
-```
-specifies that the training process lasts for 500 epochs. 
-```
-limit_test_batches: 100
-```
-Remember to add this line to force the number (100 here) of samples generated at inference. Demo config files can be found under `config/` folder
-
+Please add appopriate references when you use these datasets
 
 # References
-Refer to the following directories for more details
+If you use our work, please make sure to cite the following:
+```
+@article{dai2024guidegen,
+  title={GuideGen: A Text-Guided Framework for Full-torso Anatomy and CT Volume Generation},
+  author={Dai, Linrui and Zhang, Rongzhao and Yu, Yongrui and Zhang, Xiaofan},
+  journal={arXiv preprint arXiv:2403.07247},
+  year={2024}
+}
+```
+Our codebase is based on Latent Diffusion and other public libraries, so you can also refer to their repositories for more details
 - [Latent Diffusion](https://github.com/CompVis/latent-diffusion)
 - [taming-transformers](https://github.com/CompVis/taming-transformers)
+- [Conditional Categorical Diffusion Models](https://github.com/LarsDoorenbos/ccdm-stochastic-segmentation)

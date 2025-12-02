@@ -33,16 +33,22 @@ class DDIMStepSolver:
         
         # alias
         self.model = ddim_sampler.model
+        self.dims = ddim_sampler.model.dims
         self.ddim_alphas = ddim_sampler.ddim_alphas
         self.ddim_alphas_prev = ddim_sampler.ddim_alphas_prev
         self.ddim_sqrt_one_minus_alphas = ddim_sampler.ddim_sqrt_one_minus_alphas
         self.ddim_sigmas = ddim_sampler.ddim_sigmas
         self.ddim_sigmas_for_original_num_steps = ddim_sampler.ddim_sigmas_for_original_num_steps
         
-        self.timesteps = timesteps
         self.step_counter = 0
-        self.max_batch = max_batch
         self.iterator = iterator
+        self.timesteps = timesteps
+        self.max_batch = max_batch
+
+        self.alphas = self.model.alphas_cumprod if self.use_original_steps else self.ddim_alphas
+        self.alphas_prev = self.model.alphas_cumprod_prev if self.use_original_steps else self.ddim_alphas_prev
+        self.sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if self.use_original_steps else self.ddim_sqrt_one_minus_alphas
+        self.sigmas = self.model.ddim_sigmas_for_original_num_steps * self.ddim_sampler.eta if self.use_original_steps else self.ddim_sigmas
         
     def parse_step(self, b, device):
         t = torch.full((b,), self.timesteps[self.step_counter], device=device, dtype=torch.long)
@@ -57,10 +63,6 @@ class DDIMStepSolver:
             for idx in range(0, x.shape[0], self.max_batch):
                 res.append(self.model.apply_model(*map(lambda d: d[idx: idx+self.max_batch] if d is not None else None, [x, t, c]), **kw)) 
             res = torch.cat(res, dim=0)
-            # res2 = []
-            # for idx in range(0, x.shape[0], self.max_batch):
-            #     res2.append(self.model.apply_model(*map(lambda d: d[idx: idx+self.max_batch] if d is not None else None, [x, t, c]), return_latents=True, **kw)[-1]) 
-            # res2 = torch.cat(res2, dim=0)
             return res
     
     def _retrieve_score(self, x, c, **kw):
@@ -88,15 +90,11 @@ class DDIMStepSolver:
     def _retrieve_xprev(self, x, e_t, **kw):
         b, *_, device = *x.shape, x.device
         t, index = self.parse_step(b, device)
-        alphas = self.model.alphas_cumprod if self.use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if self.use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if self.use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps * self.ddim_sampler.eta if self.use_original_steps else self.ddim_sigmas
         # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1,) + (1,) * self.model.dims, alphas[index], device=device)
-        a_prev = torch.full((b, 1,) + (1,) * self.model.dims, alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1,) + (1,) * self.model.dims, sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1,) + (1,) * self.model.dims, sqrt_one_minus_alphas[index],device=device)
+        a_t = torch.full((b, 1,) + (1,) * self.model.dims, self.alphas[index], device=device)
+        a_prev = torch.full((b, 1,) + (1,) * self.model.dims, self.alphas_prev[index], device=device)
+        sigma_t = torch.full((b, 1,) + (1,) * self.model.dims, self.sigmas[index], device=device)
+        sqrt_one_minus_at = torch.full((b, 1,) + (1,) * self.model.dims, self.sqrt_one_minus_alphas[index], device=device)
 
         # current prediction for x_0
         if self.model.parameterization == 'eps':
@@ -113,16 +111,6 @@ class DDIMStepSolver:
         if self.noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=self.noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        # score corrector
-        # if self.score_corrector is not None:
-        #     x_prev = self.score_corrector.modify_score(ddim_sampler=self.ddim_sampler,
-        #                                                 ddim_solver=self,
-        #                                                 x=x,
-        #                                                 score=e_t,
-        #                                                 index=index,
-        #                                                 x_prev=x_prev, 
-        #                                                 dir_xt=dir_xt,
-        #                                                 noise=noise)
         return x_prev, pred_x0, dir_xt, noise
 
     def step(self, x, c, repeats=1, **kw):
@@ -136,21 +124,22 @@ class DDIMStepSolver:
                 dir_xts += dir_xt
                 noises += noise
 
-            x_prev = x_prevs / repeats
-            pred_x0 = pred_x0s / repeats
-            dir_xt = dir_xts / repeats
-            noise = noises / repeats
+            x_prev = x_prevs / math.sqrt(repeats)
+            pred_x0 = pred_x0s / math.sqrt(repeats)
+            dir_xt = dir_xts / math.sqrt(repeats)
+            noise = noises / math.sqrt(repeats)
             t, index = self.parse_step(x.shape[0], x.device)
             with torch.enable_grad():
                 x.requires_grad = True 
-                x_prev = self.score_corrector.step(ddim_sampler=self.ddim_sampler,
-                                                    ddim_solver=self,
-                                                    x=x,
-                                                    score=e_t,
-                                                    index=index,
-                                                    x_prev=x_prev,
-                                                    dir_xt=dir_xt,
-                                                    noise=noise)
+                x_prev = self.score_corrector.step(
+                    ddim_solver=self,
+                    x=x,
+                    score=e_t,
+                    index=index,
+                    x_prev=x_prev,
+                    dir_xt=dir_xt,
+                    noise=noise
+                )
         else:
             for i in range(repeats):
                 x_prev, pred_x0, *_ = self._retrieve_xprev(x, e_t, **kw)
@@ -159,9 +148,6 @@ class DDIMStepSolver:
             x_prev = x_prevs / math.sqrt(repeats)
             pred_x0 = pred_x0s / math.sqrt(repeats)
 
-        # with torch.enable_grad() if self.score_corrector is not None else torch.no_grad():
-        #     if self.score_corrector is not None: x.requires_grad = True
-        #     x_prev, pred_x0 = self._retrieve_xprev(x, e_t, **kw)
         x_prev = x_prev.detach()
         self.step_counter += 1
         return x_prev.type(x.dtype), pred_x0.type(x.dtype) 

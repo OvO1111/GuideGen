@@ -11,7 +11,6 @@ from ldm.modules.diffusionmodules.util import (
     noise_like,
     instantiate_from_config
 )
-from tensorboardX import SummaryWriter
 from ldm.models.diffusion.sampling.helpers.solver import DDIMStepSolver
 
 
