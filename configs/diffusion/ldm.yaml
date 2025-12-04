@@ -19,7 +19,7 @@ model:
     monitor: val/loss_simple
     cond_stage_trainable: true
     use_ema: false
-    ckpt_path: /ailab/user/dailinrui-hdd/data/ldm/guidegen_ldm_128_128_128_wo_textcond/checkpoints/epoch=000136.ckpt
+    ckpt_path: /ailab/user/xxx/data/ldm/guidegen_ldm_128_128_128_wo_textcond/checkpoints/epoch=000136.ckpt
 
     unet_config:
       target: ldm.modules.diffusionmodules.openaimodel.UNetModel
@@ -81,9 +81,9 @@ model:
           target: torch.nn.Identity
 
   test_only_params:
-    ckpt_path: /ailab/user/dailinrui-hdd/data/ldm/guidegen_ldm_128_128_128/checkpoints/epoch=000234.ckpt
+    ckpt_path: /ailab/user/xxx/data/ldm/guidegen_ldm_128_128_128/checkpoints/epoch=000234.ckpt
     save_dataset: true 
-    save_dataset_path: /ailab/user/dailinrui-hdd/code/latentdiffusion/rebuttal/case_check_lfg
+    save_dataset_path: /ailab/user/xxx/code/latentdiffusion/rebuttal/case_check_lfg
     suffix_keys: 
       samples: .nii.gz
       mask: .nii.gz

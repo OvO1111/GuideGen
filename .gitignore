@@ -47,7 +47,9 @@ ENV/
 ehthumbs.db
 Thumbs.db 
 
-dependency/
+dependency/*.pth
+dependency/*.pt
+dependency/openai*
 wandb/
 baselines/
 helpers/

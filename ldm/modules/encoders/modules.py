@@ -232,7 +232,7 @@ class IdentityEmbedder(AbstractEncoder):
 class FrozenBERTEmbedder(AbstractEncoder):
     use_text_split = False
     bert_max_length = 512
-    def __init__(self, ckpt_path="/ailab/user/dailinrui-hdd/data/dependency/bert-ernie-health",
+    def __init__(self, ckpt_path="/ailab/user/xxx/data/dependency/bert-ernie-health",
                  device="cuda", freeze=True, max_length=512, d_embed=768):
         super().__init__()
         self.device = device

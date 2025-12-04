@@ -41,14 +41,14 @@ data:
         patch_size: [128, 128, 128]
         use_aug: true
         any_dict: 
-          image: /ailab/user/dailinrui-hdd/data/cttr.list
+          image: /ailab/user/xxx/data/cttr.list
     validation:
       target: ldm.data.base.SimpleDataset
       params:
         split: val
         patch_size: [128, 128, 128]
         any_dict: 
-          image: /ailab/user/dailinrui-hdd/data/ctval.list
+          image: /ailab/user/xxx/data/ctval.list
 
 lightning:
   callbacks:
